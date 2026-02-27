@@ -12,11 +12,11 @@ import {
   Writable,
   writable,
 } from '@holochain-open-dev/stores';
-import { ActionHash, encodeHashToBase64, EntryHash, Link } from '@holochain/client';
+import { ActionHash, encodeHashToBase64, EntryHash, HoloHashMap, Link } from '@holochain/client';
 import {
   EntryRecord,
+  GetonlyMap,
   HashType,
-  HoloHashMap,
   retype,
 } from '@holochain-open-dev/utils';
 import { decode, encode } from '@msgpack/msgpack';
@@ -97,7 +97,7 @@ export class WorkspaceStore<S, E> {
       tipsLinks.delete(overwrittenTip);
     }
     
-    return Array.from(tipsLinks.keys());
+    return Array.from(tipsLinks.keys()) as ActionHash[];
   }
 
   async merge(commitsHashes: Array<ActionHash>): Promise<EntryRecord<Commit>> {
@@ -135,21 +135,25 @@ export class WorkspaceStore<S, E> {
 
   private async _performMerge(commitsHashes: Array<ActionHash>): Promise<EntryRecord<Commit>> {
     const commits = await toPromise(
-      sliceAndJoin(this.documentStore.commits, commitsHashes)
+      sliceAndJoin(
+        this.documentStore.commits as GetonlyMap<ActionHash, AsyncReadable<EntryRecord<Commit> | undefined>>,
+        commitsHashes
+      )
     );
     // If there are more that one tip, merge them
+    const commitValues: EntryRecord<Commit>[] = Array.from(commits.values()) as EntryRecord<Commit>[];
     let mergeState: Automerge.Doc<S> = Automerge.merge(
       Automerge.load(
-        decode(Array.from(commits.values())[0].entry.state) as any
+        decode(commitValues[0].entry.state) as Uint8Array
       ),
-      Automerge.load(decode(Array.from(commits.values())[1].entry.state) as any)
+      Automerge.load(decode(commitValues[1].entry.state) as Uint8Array)
     );
 
     for (let i = 2; i < commitsHashes.length; i++) {
       mergeState = Automerge.merge(
         mergeState,
         Automerge.load(
-          decode(Array.from(commits.values())[i].entry.state) as any
+          decode(commitValues[i].entry.state) as Uint8Array
         )
       );
     }
@@ -210,7 +214,7 @@ export class WorkspaceStore<S, E> {
                 this.workspaceHash, true
               ),
           ),
-          async commitsLinks => {
+          async (commitsLinks): Promise<ActionHash | undefined> => {
             const tipsLinks = new HoloHashMap<ActionHash, Link>();
             const tipsPrevious = new HoloHashMap<ActionHash, boolean>();
 
@@ -228,14 +232,14 @@ export class WorkspaceStore<S, E> {
             for (const overwrittenTip of tipsPrevious.keys()) {
               tipsLinks.delete(overwrittenTip);
             }
-            const tipsHashes = Array.from(tipsLinks.keys());
+            const tipsHashes = Array.from(tipsLinks.keys()) as ActionHash[];
             if (tipsHashes.length === 0) return undefined;
 
             // Return first tip without auto-merging
             // Merging will happen during session commits
             return tipsHashes[0];
           },
-          commit =>
+          (commit: ActionHash | undefined) =>
             commit ? this.documentStore.commits.get(commit) : undefined
         )
   );

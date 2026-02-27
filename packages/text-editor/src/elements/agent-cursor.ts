@@ -24,7 +24,7 @@ export class AgentCursor extends LitElement {
 
   private _profile = new StoreSubscriber(
     this,
-    () => this.profilesStore.profiles.get(this.agent),
+    () => this.profilesStore.profiles.get(this.agent)!,
     () => [this.agent]
   );
 

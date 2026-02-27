@@ -7,8 +7,17 @@ import {
 import { Commit, Document, SynClient } from '@holochain-syn/client';
 import { decode, encode } from '@msgpack/msgpack';
 import * as Automerge from '@automerge/automerge'
-import { LazyHoloHashMap, LazyMap, slice } from '@holochain-open-dev/utils';
-import { AnyDhtHash, EntryHash } from '@holochain/client';
+import { slice } from '@holochain-open-dev/utils';
+import { AnyDhtHash, EntryHash, LazyHoloHashMap } from '@holochain/client';
+
+class LazyMap<K, V> {
+  private map = new Map<K, V>();
+  constructor(private factory: (key: K) => V) {}
+  get(key: K): V {
+    if (!this.map.has(key)) this.map.set(key, this.factory(key));
+    return this.map.get(key)!;
+  }
+}
 
 import { DocumentStore } from './document-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';

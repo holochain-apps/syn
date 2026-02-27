@@ -2,6 +2,7 @@ import {
   ActionHash,
   AnyDhtHash,
   EntryHash,
+  LazyHoloHashMap,
 } from '@holochain/client';
 import {
   AsyncReadable,
@@ -14,7 +15,6 @@ import {
   EntryRecord,
   GetonlyMap,
   HashType,
-  LazyHoloHashMap,
   retype,
   slice,
 } from '@holochain-open-dev/utils';
@@ -129,6 +129,10 @@ export class DocumentStore<S, E> {
       },
       initialTipHash
     );
-    return this.workspaces.get(workspace.entryHash);
+    const workspaceStore = this.workspaces.get(workspace.entryHash);
+    if (!workspaceStore) {
+      throw new Error('Failed to create workspace store');
+    }
+    return workspaceStore;
   }
 }

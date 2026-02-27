@@ -8,6 +8,7 @@ import {
   encodeHashToBase64,
   decodeHashFromBase64,
   ActionHashB64,
+  Record as HcRecord,
 } from '@holochain/client';
 import { RecordBag } from '@holochain-open-dev/utils';
 
@@ -104,7 +105,7 @@ export class CommitHistory extends LitElement {
         return html`<sl-card style="flex: 1;">
           <span slot="header" class="title">${msg('Commit History')}</span>
           ${this.renderContent(
-          new RecordBag(this._allCommits.value.value.map(er => er.record))
+          new RecordBag((this._allCommits.value.value as Array<{ record: HcRecord }>).map(er => er.record))
         )}
         </sl-card>`;
       case 'error':

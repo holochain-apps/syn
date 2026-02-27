@@ -29,7 +29,7 @@
     "demo"
   ],
   "devDependencies": {
-    "@holochain/hc-spin": "^0.600.0",
+    "@holochain/hc-spin": "^0.600.3-rc.0",
     "concurrently": "^6.2.1",
     "eslint": "^7.32.0",
     "eslint-config-prettier": "^8.3.0",
@@ -39,6 +39,10 @@
     "typescript": "^4.9.4",
     "vitepress": "^1.0.0-rc.32",
     "vite-plugin-wasm": "^3.5.0"
+  },
+  "overrides": {
+    "@holochain/client": "^0.20.4-rc.0",
+    "@holochain-open-dev/utils": "^0.601.0"
   },
   "eslintConfig": {
     "extends": ["@open-wc/eslint-config", "eslint-config-prettier"]

@@ -1,7 +1,13 @@
 export interface SynConfig {
   hearbeatInterval: number;
+  /** Interval for polling the DHT for new session participants.
+   *  Note: internally multiplied by 10 to determine the actual polling interval. */
   newPeersDiscoveryInterval: number;
   outOfSessionTimeout: number;
+  /** Whether to send periodic heartbeat messages for presence tracking.
+   *  Set to false when presence is managed externally (e.g. by Moss).
+   *  Data sync is unaffected. Default: true. */
+  enablePresenceHeartbeat: boolean;
   commitStrategy: CommitStrategy;
 }
 
@@ -16,6 +22,7 @@ export function defaultConfig(): SynConfig {
     hearbeatInterval: 2 * 1000,
     newPeersDiscoveryInterval: 20 * 1000,
     outOfSessionTimeout: 60 * 1000,
+    enablePresenceHeartbeat: true,
     commitStrategy: { CommitEveryNDeltas: 30, CommitEveryNMs: 1000 * 10 }, // TODO: reduce ms
   };
 }
