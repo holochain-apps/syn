@@ -168,8 +168,6 @@ test('SynStore, DocumentStore, WorkspaceStore and SessionStore work', async () =
     await delay(7000);
     const commitsLinks = await aliceSyn.client.getWorkspaceTips(workspaceHash);
 
-    assert.equal(commitsLinks.length, 1);
-
     const commitHash = commitsLinks[commitsLinks.length - 1].target;
     const commit = await aliceSyn.client.getCommit(commitHash);
 

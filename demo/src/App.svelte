@@ -100,7 +100,7 @@
   let sessionStatus;
 
   let config = {
-    hearbeatInterval: 5 * 1000,
+    heartbeatInterval: 5 * 1000,
     newPeersDiscoveryInterval: 30 * 1000,
     outOfSessionTimeout: 60 * 1000,
     commitStrategy: { CommitEveryNDeltas: 200, CommitEveryNMs: 1000 * 30 },

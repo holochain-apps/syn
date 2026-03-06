@@ -74,7 +74,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   get participants() {
     return derived(this._participants, i => {
       const isActive = (lastSeen: number | undefined) =>
-        lastSeen && Date.now() - lastSeen < this.config.hearbeatInterval * 10;
+        lastSeen && Date.now() - lastSeen < this.config.heartbeatInterval * 10;
       const isIdle = (lastSeen: number | undefined) =>
         lastSeen &&
         !isActive(lastSeen) &&
@@ -282,32 +282,30 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     }, config.newPeersDiscoveryInterval * 10);
     this.intervals.push(discoveryNewParticipants);
 
-    if (config.enablePresenceHeartbeat && config.hearbeatInterval > 0) {
-      const heartbeatInterval = setInterval(async () => {
-        this._participants.update(p => {
-          const onlineParticipants = (Array.from(p.entries()) as [AgentPubKey, SessionParticipant][])
-            .filter(
-              ([_participant, info]) =>
-                info.lastSeen &&
-                Date.now() - info.lastSeen < config.outOfSessionTimeout
-            )
-            .map(([p, _]) => p)
-            .filter(p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey));
+    const heartbeatInterval = setInterval(async () => {
+      this._participants.update(p => {
+        const onlineParticipants = (Array.from(p.entries()) as [AgentPubKey, SessionParticipant][])
+          .filter(
+            ([_participant, info]) =>
+              info.lastSeen &&
+              Date.now() - info.lastSeen < config.outOfSessionTimeout
+          )
+          .map(([p, _]) => p)
+          .filter(p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey));
 
-          if (p.size > 0) {
-            this.synClient.sendMessage(onlineParticipants, {
-              workspace_hash: workspaceHash,
-              payload: {
-                type: 'Heartbeat',
-                known_participants: onlineParticipants,
-              },
-            });
-          }
-          return p;
-        });
-      }, config.hearbeatInterval);
-      this.intervals.push(heartbeatInterval);
-    }
+        if (p.size > 0) {
+          this.synClient.sendMessage(onlineParticipants, {
+            workspace_hash: workspaceHash,
+            payload: {
+              type: 'Heartbeat',
+              known_participants: onlineParticipants,
+            },
+          });
+        }
+        return p;
+      });
+    }, config.heartbeatInterval);
+    this.intervals.push(heartbeatInterval);
 
     const commitInterval = setInterval(async () => {
       if (
