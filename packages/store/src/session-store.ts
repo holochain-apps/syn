@@ -62,6 +62,7 @@ export function extractSlice<S1, E1, S2, E2>(
 
 export interface SessionParticipant {
   lastSeen: number | undefined;
+  lastActive: number | undefined;
   syncStates: { state: Automerge.SyncState; ephemeral: Automerge.SyncState };
 }
 
@@ -73,30 +74,49 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   _participants: Writable<AgentPubKeyMap<SessionParticipant>>;
   get participants() {
     return derived(this._participants, i => {
-      const isActive = (lastSeen: number | undefined) =>
-        lastSeen && Date.now() - lastSeen < this.config.heartbeatInterval * 10;
-      const isIdle = (lastSeen: number | undefined) =>
-        lastSeen &&
-        !isActive(lastSeen) &&
-        Date.now() - lastSeen < this.config.outOfSessionTimeout;
-      const isOffline = (lastSeen: number | undefined) =>
-        !lastSeen || Date.now() - lastSeen > this.config.outOfSessionTimeout;
+      // Make sure I'm in participants list
+      if (!i.has(this.myPubKey)) {
+        i.set(this.myPubKey, {
+            lastSeen: Date.now(),
+            lastActive: Date.now(),
+            syncStates: {
+            state: Automerge.initSyncState(),
+            ephemeral: Automerge.initSyncState(),
+          },
+        });
+      }
+      // Active is here and active recently
+      const isActive = (lastActive: number | undefined) =>
+        lastActive && Date.now() - lastActive < this.config.inactiveSessionThreshold;
+      // Offline is not seen or active since timeout 
+      const isOffline = (lastSeen: number | undefined, lastActive: number | undefined) =>
+        !isActive(lastActive) && 
+        (!lastSeen || Date.now() - lastSeen > this.config.outOfSessionTimeout);
+      // Idle is here and seen recently but not active
+      const isIdle = (lastSeen: number | undefined, lastActive: number | undefined) =>
+        !isActive(lastActive) && !isOffline(lastSeen, lastActive);
 
       const entries = Array.from(i.entries()) as [AgentPubKey, SessionParticipant][];
 
       const active = entries
         .filter(
-          ([pubkey, info]) =>
-            isActive(info.lastSeen) && !isEqual(pubkey, this.myPubKey)
-        )
+          ([_, info]) => isActive(info.lastActive))
         .map(([pubkey, _]) => pubkey);
-      active.push(this.myPubKey);
 
       const idle = entries
-        .filter(([_, info]) => isIdle(info.lastSeen))
+        .filter(([_, info]) => isIdle(info.lastSeen, info.lastActive))
         .map(([pubkey, _]) => pubkey);
+
+      // If I'm not in active or idle, add me to idle
+      if (!active.find(p => isEqual(p, this.myPubKey)) 
+        && !idle.find(p => isEqual(p, this.myPubKey))
+      ) {
+        idle.push(this.myPubKey);
+      }
+
       const offline = entries
-        .filter(([_, info]) => isOffline(info.lastSeen))
+        .filter(([pubkey, info]) => isOffline(info.lastSeen, info.lastActive) && 
+            !isEqual(pubkey, this.myPubKey))
         .map(([pubkey, _]) => pubkey);
 
       return {
@@ -269,6 +289,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         for (const newParticipant of newParticipants) {
           p.set(retype(newParticipant.target, HashType.AGENT), {
             lastSeen: Date.now(),
+            lastActive: undefined,
             syncStates: {
               state: Automerge.initSyncState(),
               ephemeral: Automerge.initSyncState(),
@@ -344,6 +365,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     for (const p of initialParticipants) {
       participantsMap.set(p, {
         lastSeen: Date.now(),
+        lastActive: this.myPubKey === p ? Date.now() : undefined,
         syncStates: {
           state: Automerge.initSyncState(),
           ephemeral: Automerge.initSyncState(),
@@ -437,6 +459,22 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         const otherParticipants = participantsArray.filter(
           p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
         );
+
+        console.log(`All participant statuses: ${JSON.stringify(get(this.participants), null, 2)}`);
+
+        // Set me to active
+        this._participants.update(p => {
+            const info = p.get(this.myPubKey);
+            if (info) {
+                p.set(this.myPubKey, {
+                    ...info,
+                    lastActive: Date.now(),
+                    lastSeen: Date.now(),
+                });
+            }
+            return p;
+        });
+
         this.workspaceStore.documentStore.synStore.client.sendMessage(
           otherParticipants,
           {
@@ -456,10 +494,20 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   private handleChangeNotice(
-    _from: AgentPubKey,
+    from: AgentPubKey,
     stateChanges: Uint8Array[],
     ephemeralChanges: Uint8Array[]
   ) {
+    this._participants.update(p => {
+        const participantInfo = p.get(from);
+        if (participantInfo) {
+            participantInfo.lastSeen = Date.now();
+            participantInfo.lastActive = Date.now();
+            p.set(from, participantInfo);
+        }
+        return p;
+    });
+
     this.deltaCount += stateChanges.length;
 
     this._state.update(state => {
@@ -689,6 +737,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       for (const newParticipant of newParticipants) {
         p.set(newParticipant, {
           lastSeen: undefined,
+          lastActive: undefined,
           syncStates: {
             state: Automerge.initSyncState(),
             ephemeral: Automerge.initSyncState(),
@@ -724,6 +773,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     this._participants.update(p => {
       p.set(participant, {
         lastSeen: Date.now(),
+        lastActive: undefined,
         syncStates: {
           state: Automerge.initSyncState(),
           ephemeral: Automerge.initSyncState(),
