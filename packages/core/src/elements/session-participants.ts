@@ -21,24 +21,35 @@ export class SessionParticipants extends LitElement {
   @property()
   direction: 'column' | 'row' = 'column';
 
+  @property({ type: Boolean })
+  showOffline = false;
+
   _participants = new StoreSubscriber(
     this,
     () => this.sessionstore.participants,
     () => [this.sessionstore]
   );
 
-  renderParticipant(pubKey: AgentPubKey, idle: boolean) {
+  renderParticipant(pubKey: AgentPubKey, status: string) {
+    const classes = {
+      'status-dot': true,
+      active: status === 'active',
+      idle: status === 'idle',
+      offline: status === 'offline',
+    };
     return html`
-      <agent-avatar
-        class="${classMap({
-          'out-of-session': idle,
-        })}"
-        .agentPubKey=${pubKey}
+      <div
+        class="participant"
         style=${styleMap({
           'margin-bottom': this.direction === 'column' ? '8px' : '0px',
-          'margin-right': this.direction === 'row' ? '8px' : '0px',
+          'margin-right': this.direction === 'row' ? '-4px' : '0px',
         })}
-      ></agent-avatar>
+      >
+        <agent-avatar
+          .agentPubKey=${pubKey}
+        ></agent-avatar>
+        <span class=${classMap(classes)}></span>
+        </div>
     `;
   }
 
@@ -51,11 +62,16 @@ export class SessionParticipants extends LitElement {
         })}
       >
         ${this._participants.value.active.map(pubKey =>
-          this.renderParticipant(pubKey, false)
+          this.renderParticipant(pubKey, 'active')
         )}
         ${this._participants.value.idle.map(pubKey =>
-          this.renderParticipant(pubKey, true)
+          this.renderParticipant(pubKey, 'idle')
         )}
+        ${this.showOffline
+          ? this._participants.value.offline.map(pubKey =>
+              this.renderParticipant(pubKey, 'offline')
+            )
+          : ''}
       </div>
     `;
   }
@@ -64,8 +80,33 @@ export class SessionParticipants extends LitElement {
     return [
       sharedStyles,
       css`
+        .participant {
+          display: flex;
+          flex-direction: row;
+          align-items: center;
+          position: relative;
+        }
         .out-of-session {
           opacity: 0.5;
+        }
+        .status-dot {
+          position: relative;
+          bottom: -10px;
+          right: 10px;
+          width: 12px;
+          height: 12px;
+          border-radius: 50%;
+          border: 2px solid white;
+        }
+        .status-dot.active {
+          background-color: #00e676;
+        }
+        .status-dot.idle {
+          background-color: #ffa726;
+        }
+        .status-dot.offline {
+          background-color: transparent;
+          border-color: #999;
         }
       `,
     ];

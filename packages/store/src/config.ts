@@ -4,6 +4,7 @@ export interface SynConfig {
    *  Note: internally multiplied by 10 to determine the actual polling interval. */
   newPeersDiscoveryInterval: number;
   outOfSessionTimeout: number;
+  inactiveSessionThreshold: number;
   commitStrategy: CommitStrategy;
 }
 
@@ -18,6 +19,7 @@ export function defaultConfig(): SynConfig {
     heartbeatInterval: 2 * 1000,
     newPeersDiscoveryInterval: 20 * 1000,
     outOfSessionTimeout: 60 * 1000,
+    inactiveSessionThreshold: 20 * 1000,
     commitStrategy: { CommitEveryNDeltas: 30, CommitEveryNMs: 1000 * 10 }, // TODO: reduce ms
   };
 }

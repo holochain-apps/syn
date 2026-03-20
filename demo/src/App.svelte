@@ -187,7 +187,7 @@
 
       <div class="folks-tray">
         <h3>Participants</h3>
-        <session-participants sessionstore={sessionStore} />
+        <session-participants direction="row" showOffline={true} sessionstore={sessionStore} />
       </div>
     </syn-context>
   </profiles-context>
