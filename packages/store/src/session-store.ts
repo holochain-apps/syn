@@ -461,8 +461,6 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
         );
 
-        console.log(`All participant statuses: ${JSON.stringify(get(this.participants), null, 2)}`);
-
         // Set me to active
         this._participants.update(p => {
             const info = p.get(this.myPubKey);
