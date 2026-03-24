@@ -410,7 +410,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   amILeader(): boolean {
-    const activeParticipants = get(this.participants).active
+    const { active, idle } = get(this.participants);
+    const activeParticipants = [...active, ...idle]
       .map(p => encodeHashToBase64(p))
       .sort((p1, p2) => {
         if (p1 < p2) {

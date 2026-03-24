@@ -2,7 +2,7 @@ import { css, html, LitElement } from 'lit';
 import type { SessionStore } from '@holochain-syn/store';
 import { customElement, property } from 'lit/decorators.js';
 import { consume } from '@lit/context';
-import { AgentPubKey } from '@holochain/client';
+import { AgentPubKey, encodeHashToBase64 } from '@holochain/client';
 import { classMap } from 'lit/directives/class-map.js';
 import { styleMap } from 'lit/directives/style-map.js';
 import { StoreSubscriber } from '@holochain-open-dev/stores';
@@ -61,12 +61,17 @@ export class SessionParticipants extends LitElement {
           row: this.direction === 'row',
         })}
       >
-        ${this._participants.value.active.map(pubKey =>
-          this.renderParticipant(pubKey, 'active')
-        )}
-        ${this._participants.value.idle.map(pubKey =>
-          this.renderParticipant(pubKey, 'idle')
-        )}
+        ${[
+          ...this._participants.value.active.map(pubKey => ({ pubKey, status: 'active' })),
+          ...this._participants.value.idle.map(pubKey => ({ pubKey, status: 'idle' })),
+        ]
+          .sort((a, b) => {
+            const ka = encodeHashToBase64(a.pubKey);
+            const kb = encodeHashToBase64(b.pubKey);
+            return ka < kb ? -1 : ka > kb ? 1 : 0;
+          })
+          .map(({ pubKey, status }) => this.renderParticipant(pubKey, status))
+        }
         ${this.showOffline
           ? this._participants.value.offline.map(pubKey =>
               this.renderParticipant(pubKey, 'offline')
