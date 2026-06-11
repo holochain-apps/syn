@@ -4,7 +4,9 @@
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "type": "module",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -16,10 +18,10 @@
     "build:watch": "tsc -w --preserveWatchOutput"
   },
   "dependencies": {
-    "@holochain/client": "^0.20.4-rc.0",
+    "@automerge/automerge": "^3.2.6",
     "@holochain-open-dev/utils": "^0.601.0",
-    "@msgpack/msgpack": "^2.7.0",
-    "@automerge/automerge":"^3.2.0"
+    "@holochain/client": "^0.20.4-rc.0",
+    "@msgpack/msgpack": "^2.7.0"
   },
   "devDependencies": {
     "gh-pages": "^3.2.3",
