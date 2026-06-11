@@ -3,7 +3,7 @@ import { assert, test } from 'vitest';
 import { dhtSync, runScenario, Player } from '@holochain-open-dev/tryorama';
 
 import { get } from '@holochain-open-dev/stores';
-import { SynStore, stateFromCommit } from '@holochain-syn/store';
+import { SynStore } from '@holochain-syn/store';
 import { SynClient, Commit } from '@holochain-syn/client';
 import { AppBundleSource, encodeHashToBase64 } from '@holochain/client';
 import { encode } from '@msgpack/msgpack';
@@ -181,11 +181,14 @@ test(
           .insert(0, 'SURVIVOR')
       );
 
-      const tipHasSurvivorEdit = () => {
+      const tipHasSurvivorEdit = async () => {
         const tip = get(survivorSession.currentTip);
         if (!tip) return false;
         try {
-          const state = stateFromCommit(tip.entry) as Content;
+          // The tip may be a delta commit: reconstruct its full state
+          const state = (await survivorSession.workspace.documentStore.resolveCommitState(
+            tip
+          )) as Content;
           return state.body.text.join('').includes('SURVIVOR');
         } catch (e) {
           return false;
@@ -241,11 +244,14 @@ test(
           .insert(0, 'FIRST')
       );
 
-      const tipHasEdit = () => {
+      const tipHasEdit = async () => {
         const tip = get(survivorSession.currentTip);
         if (!tip) return false;
         try {
-          const state = stateFromCommit(tip.entry) as Content;
+          // The tip may be a delta commit: reconstruct its full state
+          const state = (await survivorSession.workspace.documentStore.resolveCommitState(
+            tip
+          )) as Content;
           return state.body.text.join('').includes('FIRST');
         } catch (e) {
           return false;
@@ -394,11 +400,14 @@ test(
           .insert(4, ' AFTER')
       );
 
-      const committedAfterCorrupt = () => {
+      const committedAfterCorrupt = async () => {
         const tip = get(session.currentTip);
         if (!tip) return false;
         try {
-          const state = stateFromCommit(tip.entry) as Content;
+          // The tip may be a delta commit: reconstruct its full state
+          const state = (await session.workspace.documentStore.resolveCommitState(
+            tip
+          )) as Content;
           return (
             state.body.text.join('').includes('AFTER') &&
             get(session.sessionStatus).code === 'ok'

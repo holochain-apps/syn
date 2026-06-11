@@ -9,8 +9,10 @@ import {
   immutableEntryStore,
   liveLinksStore,
   pipe,
+  toPromise,
   uniquify,
 } from '@holochain-open-dev/stores';
+import * as Automerge from '@automerge/automerge';
 import {
   EntryRecord,
   GetonlyMap,
@@ -23,6 +25,7 @@ import { Commit } from '@holochain-syn/client';
 import { SynStore } from './syn-store.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
+import { decodeCommitPayload } from './commit-payload.js';
 
 export function sliceStrings<K extends string, V>(
   map: GetonlyMap<K, V>,
@@ -123,6 +126,50 @@ export class DocumentStore<S, E> {
     ),
     links => uniquify(links.map(l => retype(l.target, HashType.AGENT)))
   );
+
+  /**
+   * Reconstructs the full document state at the given commit.
+   *
+   * Snapshot commits load directly. Delta commits walk back through
+   * `previous_commit_hashes` to the nearest snapshot and replay the deltas
+   * forward. The walk is bounded by the commit strategy's snapshot cadence:
+   * merge commits and every Nth commit are full snapshots.
+   *
+   * Commits are fetched from the locally integrated DHT store; if part of
+   * the chain hasn't gossiped to us yet this throws after the underlying
+   * store's retries, and the caller is expected to converge through the
+   * session sync paths instead.
+   */
+  async resolveCommitState(
+    commit: EntryRecord<Commit>
+  ): Promise<Automerge.Doc<unknown>> {
+    const deltas: Uint8Array[] = [];
+    let current = commit;
+    for (;;) {
+      const payload = decodeCommitPayload(current.entry.state);
+      if (payload.kind === 'snapshot') {
+        let doc = Automerge.load(payload.data);
+        for (const delta of deltas.reverse()) {
+          doc = Automerge.loadIncremental(doc, delta);
+        }
+        if (deltas.length > 0) {
+          // Rebuild through a save/load round-trip: incremental loads can
+          // leave the doc in an internal state that makes later changes
+          // panic in the wasm module (automerge#1327)
+          doc = Automerge.load(Automerge.save(doc));
+        }
+        return doc;
+      }
+      deltas.push(payload.data);
+      // Delta commits are only created on a linear tip: every hash in
+      // previous_commit_hashes points to the same entry, so any parent works
+      const parentHash = current.entry.previous_commit_hashes[0];
+      if (!parentHash) {
+        throw new Error('Delta commit has no previous commit');
+      }
+      current = await toPromise(this.commits.get(parentHash)!);
+    }
+  }
 
   async createWorkspace(
     workspaceName: string,

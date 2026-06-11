@@ -32,6 +32,9 @@ export interface SynConfig {
 export interface CommitStrategy {
   CommitEveryNMs: number | undefined;
   CommitEveryNDeltas: number | undefined;
+  /** Write a full-state snapshot commit after this many consecutive delta
+   *  commits. Merge commits and first commits are always snapshots. */
+  SnapshotEveryNCommits: number;
 }
 
 export function defaultConfig(): SynConfig {
@@ -43,7 +46,11 @@ export function defaultConfig(): SynConfig {
     viewSettlingWindow: 4 * 1000,
     commitStaggerWindow: 60 * 1000,
     ghostSignalTimeout: 5 * 60 * 1000,
-    commitStrategy: { CommitEveryNDeltas: 30, CommitEveryNMs: 1000 * 10 }, // TODO: reduce ms
+    commitStrategy: {
+      CommitEveryNDeltas: 30,
+      CommitEveryNMs: 1000 * 10,
+      SnapshotEveryNCommits: 20,
+    },
   };
 }
 

@@ -22,10 +22,16 @@ class LazyMap<K, V> {
 
 import { DocumentStore } from './document-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
+import { decodeCommitPayload } from './commit-payload.js';
 
 export const stateFromCommit = (commit: Commit) => {
-  const commitState = decode(commit.state) as Uint8Array;
-  const state = Automerge.load(commitState);
+  const payload = decodeCommitPayload(commit.state);
+  if (payload.kind !== 'snapshot') {
+    throw new Error(
+      'Cannot load state from a delta commit alone: use DocumentStore.resolveCommitState() to reconstruct it from its snapshot ancestor'
+    );
+  }
+  const state = Automerge.load(payload.data);
   return state;
 };
 

@@ -200,7 +200,10 @@ test(
       const tips = await aliceWorkspaceStore.getCurrentTips();
       assert.equal(tips.length, 1, 'expected a single tip after the merge');
       const tipRecord = await aliceSyn.client.getCommit(tips[0]);
-      const tipState = stateFromCommit(tipRecord!.entry) as Content;
+      // The tip may be a delta commit: reconstruct its full state
+      const tipState = (await aliceDocumentStore.resolveCommitState(
+        tipRecord!
+      )) as Content;
 
       // The merged content must survive into the new tip and into alice's
       // own doc. Today the commit issued right after the merge carries
@@ -395,7 +398,10 @@ test(
       const tips = await aliceWorkspaceStore.getCurrentTips();
       assert.equal(tips.length, 1, 'a single tip must remain');
       const tipRecord = await aliceSyn.client.getCommit(tips[0]);
-      const tipState = stateFromCommit(tipRecord!.entry) as Content;
+      // The tip may be a delta commit: reconstruct its full state
+      const tipState = (await aliceDocumentStore.resolveCommitState(
+        tipRecord!
+      )) as Content;
       const tipText = tipState.body.text.join('');
       assert.include(tipText, 'AAA', "the tip must contain alice's edit");
       assert.include(tipText, 'BBB', "the tip must contain bob's edit");

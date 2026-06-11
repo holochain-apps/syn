@@ -32,13 +32,13 @@ export const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 /** Poll `condition` every `intervalMs` until it holds or `timeoutMs` runs
  *  out; returns the final value of the condition. */
 export async function waitUntil(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   timeoutMs: number,
   intervalMs = 500
 ) {
   const rounds = Math.ceil(timeoutMs / intervalMs);
   for (let i = 0; i < rounds; i++) {
-    if (condition()) return true;
+    if (await condition()) return true;
     await delay(intervalMs);
   }
   return condition();

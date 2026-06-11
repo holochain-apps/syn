@@ -13,13 +13,27 @@ import {
 } from '@holochain-open-dev/stores';
 import { decode, encode } from '@msgpack/msgpack';
 import * as Automerge from '@automerge/automerge';
-import { encodeHashToBase64, AgentPubKey, AgentPubKeyMap } from '@holochain/client';
+import { ActionHash, encodeHashToBase64, AgentPubKey, AgentPubKeyMap } from '@holochain/client';
 import isEqual from 'lodash-es/isEqual.js';
 import { toPromise } from '@holochain-open-dev/stores';
 
 import { SynConfig } from './config.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { stateFromCommit } from './syn-store.js';
+import {
+  CommitPayload,
+  decodeCommitPayload,
+  encodeCommitPayload,
+} from './commit-payload.js';
+
+const commitDepth = (commit: Commit): number => {
+  try {
+    const payload = decodeCommitPayload(commit.state);
+    return payload.kind === 'delta' ? payload.depth : 0;
+  } catch (e) {
+    return 0;
+  }
+};
 
 export type SessionStatus = {
   code: 'ok' | 'error' | 'syncing';
@@ -161,9 +175,11 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   private intervals: any[] = [];
   private deltaCount = 0;
 
-  // Heads of the state recorded in the current tip commit: the basis for
-  // the cheap in-sync check
+  // Heads and delta-depth of the state recorded in the current tip commit.
+  // The heads are the basis for delta commits (saveSince) and for the cheap
+  // in-sync check; the depth bounds the delta chain before a snapshot is due.
   private _tipHeads: Automerge.Heads | undefined;
+  private _tipDepth = 0;
 
   // Leadership rank is only acted on when the participant view has been
   // stable for the settling window and we're outside the collision backoff
@@ -242,28 +258,105 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           const author =
             message.payload.new_commit.signed_action.hashed.content.author;
 
-          // Merge the commit's state into our local document. The commit
-          // carries the full document, so we converge even when its author
-          // is no longer reachable for an interactive sync.
+          // An identical entry authored concurrently by another agent (e.g.
+          // two leaders racing the same deterministic merge) carries the
+          // same content: no merging or syncing needed. Keep the canonical
+          // (lowest base64) action as our tip so all agents converge on it.
+          if (
+            currentTip &&
+            encodeHashToBase64(newCommit.entryHash) ===
+              encodeHashToBase64(currentTip.entryHash)
+          ) {
+            if (
+              encodeHashToBase64(newCommit.actionHash) <
+              encodeHashToBase64(currentTip.actionHash)
+            ) {
+              this._currentTip.set(newCommit);
+            }
+            return;
+          }
+
+          // Apply the commit's payload to our local document. The
+          // notification carries the data itself, so we converge even when
+          // its author is no longer reachable for an interactive sync.
+          let payload: CommitPayload;
+          try {
+            payload = decodeCommitPayload(newCommit.entry.state);
+          } catch (error) {
+            // Don't adopt a tip whose content we can't decode: our next
+            // commit would silently drop that content from the history.
+            console.error('Failed to decode incoming commit payload:', error);
+            this.requestSync(author);
+            return;
+          }
+
           let commitHeads: Automerge.Heads;
           try {
-            const commitState = stateFromCommit(
-              newCommit.entry
-            ) as Automerge.Doc<S>;
-            commitHeads = Automerge.getHeads(commitState);
             const state = get(this._state);
-            // Skip the merge when our document already contains the
-            // commit's changes (the common case: they arrived as deltas
-            // through ChangeNotice signals before the commit did)
-            if (!this.headsInHistory(state, commitHeads)) {
-              // Merge a clone outside the store update: Automerge.merge
-              // consumes its target, so a failure mid-merge must not leave
-              // the live document frozen
-              const next = this.mergeRebuilt(
-                Automerge.clone(state, Automerge.getActorId(state)),
-                commitState
-              );
-              this._state.set(next);
+            if (payload.kind === 'delta') {
+              commitHeads = payload.heads;
+              // Skip application when our document already contains the
+              // delta's changes (the common case: they arrived through
+              // ChangeNotice signals before the commit did)
+              if (!this.headsInHistory(state, commitHeads)) {
+                // Apply on a clone outside the store update so a mid-apply
+                // throw can't freeze the live document, then rebuild
+                // through save/load (automerge#1327, see mergeRebuilt)
+                const actor = Automerge.getActorId(state);
+                const applied = Automerge.loadIncremental(
+                  Automerge.clone(state, actor),
+                  payload.data
+                );
+                const next = Automerge.load(Automerge.save(applied), {
+                  actor,
+                }) as Automerge.Doc<S>;
+                if (!this.headsInHistory(next, commitHeads)) {
+                  // The delta references history we don't have. Don't adopt
+                  // the tip; converge through an interactive sync with the
+                  // author and through reconstruction from the locally
+                  // integrated DHT store as gossip delivers the chain.
+                  this.requestSync(author);
+                  this.workspaceStore.documentStore
+                    .resolveCommitState(newCommit)
+                    .then(doc => {
+                      const current = get(this._state);
+                      this._state.set(
+                        this.mergeRebuilt(
+                          Automerge.clone(
+                            current,
+                            Automerge.getActorId(current)
+                          ),
+                          doc as Automerge.Doc<S>
+                        )
+                      );
+                      void this.updateSyncStatus();
+                    })
+                    .catch(() => {
+                      // Part of the chain hasn't gossiped to us yet; the
+                      // sync path converges us in the meantime
+                    });
+                  void this.updateSyncStatus();
+                  return;
+                }
+                this._state.set(next);
+              }
+            } else {
+              const commitState = Automerge.load(
+                payload.data
+              ) as Automerge.Doc<S>;
+              commitHeads = Automerge.getHeads(commitState);
+              // Skip the merge when our document already contains the
+              // commit's changes
+              if (!this.headsInHistory(state, commitHeads)) {
+                // Merge a clone outside the store update: Automerge.merge
+                // consumes its target, so a failure mid-merge must not leave
+                // the live document frozen
+                const next = this.mergeRebuilt(
+                  Automerge.clone(state, Automerge.getActorId(state)),
+                  commitState
+                );
+                this._state.set(next);
+              }
             }
           } catch (error) {
             // Don't adopt a tip whose content we couldn't absorb: our next
@@ -297,6 +390,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
 
           this._currentTip.set(newCommit);
           this._tipHeads = commitHeads;
+          this._tipDepth = payload.kind === 'delta' ? payload.depth : 0;
           // Refresh the save point and clear the divergence clock if the
           // commit covered our local changes; otherwise the clock keeps
           // running so a non-leader can still take over committing what
@@ -447,6 +541,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     this._currentTip = writable(currentTip);
     // At join, the session state is exactly the resolved tip state
     this._tipHeads = currentTip ? Automerge.getHeads(currentState) : undefined;
+    this._tipDepth = currentTip ? commitDepth(currentTip.entry) : 0;
 
     const participantsMap: AgentPubKeyMap<SessionParticipant> =
       new AgentPubKeyMap();
@@ -933,14 +1028,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       meta = encode(meta);
     }
 
-    // Check if there are multiple workspace tips that need to be merged
-    const workspaceTips = await this.workspaceStore.getCurrentTips();
+    // Check if there are multiple distinct workspace tips that need merging.
+    // Tips sharing an entry hash are byte-identical commits authored
+    // concurrently and don't count as divergence.
+    const tipGroups = await this.workspaceStore.getCurrentTipGroups();
     let currentTip = get(this._currentTip);
 
-    if (workspaceTips.length > 1) {
-      console.log('Multiple workspace tips detected during session commit, merging:', workspaceTips.map(h => encodeHashToBase64(h)));
+    if (tipGroups.length > 1) {
+      console.log('Multiple workspace tips detected during session commit, merging:', tipGroups.flat().map(h => encodeHashToBase64(h)));
       // Merge the tips before creating our commit
-      const mergedCommit = await this.workspaceStore.merge(workspaceTips);
+      const mergedCommit = await this.workspaceStore.merge(tipGroups.flat());
 
       // Bring the merged state into our own document; otherwise the commit
       // below would replace the merge with our pre-merge snapshot. Only
@@ -961,6 +1058,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       currentTip = mergedCommit;
       this._currentTip.set(mergedCommit);
       this._tipHeads = mergedHeads;
+      this._tipDepth = 0;
 
       // If the merge already contains everything we have locally, the merge
       // commit is the new tip and the only thing to broadcast: there is
@@ -978,8 +1076,64 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       }
     }
 
-    const previous_commit_hashes = currentTip ? [currentTip.actionHash] : [];
+    // Supersede every action hash of the tip's group: concurrently authored
+    // identical entries must all stop being tips
+    let previous_commit_hashes: Array<ActionHash> = [];
+    if (currentTip) {
+      const tipB64 = encodeHashToBase64(currentTip.actionHash);
+      const group = tipGroups.find(g =>
+        g.some(h => encodeHashToBase64(h) === tipB64)
+      );
+      previous_commit_hashes = group ?? [currentTip.actionHash];
+    }
+
     const stateAtCommit = get(this._state);
+    const stateHeads = Automerge.getHeads(stateAtCommit);
+
+    // Store only the changes since the tip; write a full snapshot for the
+    // first commit, when the delta chain has reached the snapshot cadence,
+    // or when the tip's heads aren't fully part of our history
+    const snapshotEvery = this.config.commitStrategy.SnapshotEveryNCommits;
+    const canDelta =
+      !!currentTip &&
+      !!this._tipHeads &&
+      this._tipDepth + 1 < snapshotEvery &&
+      this.headsInHistory(stateAtCommit, this._tipHeads);
+
+    let payload: CommitPayload | undefined;
+    let newDepth = 0;
+    if (canDelta) {
+      // saveSince can panic (MissingOps) when the live doc carries
+      // out-of-order/pending changes from rapid ChangeNotice traffic — a
+      // state Automerge.save() tolerates but the incremental encoder does
+      // not. Compute the delta on a clone so a panic poisons only the
+      // throwaway doc and never the live session document, and fall back to
+      // a full snapshot when it can't produce a clean delta.
+      try {
+        const clone = Automerge.clone(
+          stateAtCommit,
+          Automerge.getActorId(stateAtCommit)
+        );
+        const data = Automerge.saveSince(clone, this._tipHeads!);
+        newDepth = this._tipDepth + 1;
+        payload = {
+          kind: 'delta',
+          data,
+          heads: stateHeads,
+          depth: newDepth,
+        };
+      } catch (error) {
+        console.warn(
+          'saveSince failed; falling back to a snapshot commit:',
+          error
+        );
+        newDepth = 0;
+      }
+    }
+    if (!payload) {
+      payload = { kind: 'snapshot', data: Automerge.save(stateAtCommit) };
+    }
+
     const commit: Commit = {
       authors: [
         ...(Array.from(get(this._participants).keys()) as AgentPubKey[]),
@@ -987,7 +1141,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       ],
       meta,
       previous_commit_hashes,
-      state: encode(Automerge.save(stateAtCommit)),
+      state: encodeCommitPayload(payload),
       witnesses: [],
       document_hash: this.workspaceStore.documentStore.documentHash,
     };
@@ -996,7 +1150,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       const newCommit = await this.synClient.createCommit(commit);
 
       this._currentTip.set(newCommit);
-      this._tipHeads = Automerge.getHeads(stateAtCommit);
+      this._tipHeads = stateHeads;
+      this._tipDepth = newDepth;
       this.notifyNewCommit(newCommit);
 
       await this.synClient.updateWorkspaceTip(
