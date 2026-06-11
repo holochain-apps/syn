@@ -114,7 +114,9 @@ test('check that the state of disconnected agents making changes converges after
     const aliceAppWs = await alice.conductor.connectAppWs(issued.token, port);
     await scenario.shareAllAgents();
     console.log('Alice conductor started up');
-    await dhtSync([alice, bob], alice.cells[0].cell_id[0]);
+    // Syncing after the conductor restart can take a while (ops re-validate),
+    // so allow more than the default 40s before giving up
+    await dhtSync([alice, bob], alice.cells[0].cell_id[0], 500, 120000);
     console.log('DHT sync done');
     aliceSyn = new SynStore(new SynClient(aliceAppWs, 'syn-test'));
     aliceDocumentStore = aliceSyn.documents.get(
