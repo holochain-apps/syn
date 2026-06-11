@@ -142,20 +142,32 @@ export class WorkspaceStore<S, E> {
     );
     // If there are more that one tip, merge them
     const commitValues: EntryRecord<Commit>[] = Array.from(commits.values()) as EntryRecord<Commit>[];
-    let mergeState: Automerge.Doc<S> = Automerge.merge(
-      Automerge.load(
-        decode(commitValues[0].entry.state) as Uint8Array
-      ),
-      Automerge.load(decode(commitValues[1].entry.state) as Uint8Array)
-    );
 
-    for (let i = 2; i < commitsHashes.length; i++) {
-      mergeState = Automerge.merge(
-        mergeState,
-        Automerge.load(
-          decode(commitValues[i].entry.state) as Uint8Array
-        )
-      );
+    // A tip whose state can't be loaded (corrupt bytes, or written by an
+    // incompatible client) can never be merged by anyone, and a single such
+    // commit must not wedge the document forever. Merge the loadable tips
+    // and supersede the unloadable ones as parents, so they stop being
+    // tips; live participants that hold their content still converge over
+    // the sync channel and re-commit it.
+    const loadableStates: Automerge.Doc<S>[] = [];
+    for (const commitValue of commitValues) {
+      try {
+        loadableStates.push(stateFromCommit(commitValue.entry) as Automerge.Doc<S>);
+      } catch (error) {
+        console.error(
+          'Skipping unloadable tip state during merge:',
+          encodeHashToBase64(commitValue.actionHash),
+          error
+        );
+      }
+    }
+    if (loadableStates.length === 0) {
+      throw new Error('None of the tip states to merge could be loaded');
+    }
+
+    let mergeState: Automerge.Doc<S> = loadableStates[0];
+    for (let i = 1; i < loadableStates.length; i++) {
+      mergeState = Automerge.merge(mergeState, loadableStates[i]);
     }
 
     const documentHash = this.documentStore.documentHash;
