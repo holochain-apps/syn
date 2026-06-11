@@ -20,6 +20,7 @@ import {
   sampleGrammar,
   synHapp,
   waitForOtherParticipants,
+  waitUntil,
 } from '../common.js';
 import { textEditorGrammar } from '../text-editor-grammar.js';
 
@@ -93,19 +94,6 @@ function restrictSignals(client: SynClient, allowedTypes: string[]) {
     }
     return Promise.resolve();
   };
-}
-
-async function waitUntil(
-  condition: () => boolean,
-  timeoutMs: number,
-  intervalMs = 500
-) {
-  const rounds = Math.ceil(timeoutMs / intervalMs);
-  for (let i = 0; i < rounds; i++) {
-    if (condition()) return true;
-    await delay(intervalMs);
-  }
-  return condition();
 }
 
 test(

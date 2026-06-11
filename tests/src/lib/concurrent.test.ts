@@ -11,6 +11,7 @@ import {
   sampleGrammar,
   synHapp,
   waitForOtherParticipants,
+  waitUntil,
 } from '../common.js';
 import { textEditorGrammar } from '../text-editor-grammar.js';
 import { AppBundleSource } from '@holochain/client';
@@ -87,14 +88,12 @@ test('the state of two agents making lots of concurrent changes converges', asyn
     // Wait until bob's doc has actually received alice's initial content;
     // typing into a not-yet-synced doc anchors the first characters at the
     // head of the text and they end up interleaved with alice's line
-    for (let i = 0; i < 60; i++) {
-      if (
+    await waitUntil(
+      () =>
         get(bobSessionStore.state).body.text.join('') ===
-        get(aliceSessionStore.state).body.text.join('')
-      )
-        break;
-      await delay(500);
-    }
+        get(aliceSessionStore.state).body.text.join(''),
+      30_000
+    );
     assert.equal(
       get(bobSessionStore.state).body.text.join(''),
       get(aliceSessionStore.state).body.text.join(''),
