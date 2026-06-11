@@ -211,7 +211,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
             const commitState = Automerge.load(
               decode(newCommit.entry.state) as Uint8Array
             ) as Automerge.Doc<S>;
-            this._state.update(state => Automerge.merge(state, commitState));
+            this._state.update(state =>
+              this.mergeRebuilt(state, commitState)
+            );
           } catch (error) {
             console.error('Failed to merge state from incoming commit:', error);
           }
@@ -655,6 +657,19 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     }
   }
 
+  // Merge `other` into `doc` and rebuild the doc through a save/load
+  // round-trip. The round-trip works around an automerge bug where merged
+  // documents can be left with internal index gaps that later make change
+  // commits or sync-message generation panic inside the wasm module
+  // (https://github.com/automerge/automerge/issues/1327).
+  private mergeRebuilt(
+    doc: Automerge.Doc<S>,
+    other: Automerge.Doc<S>
+  ): Automerge.Doc<S> {
+    const merged = Automerge.merge(doc, other);
+    return Automerge.load(Automerge.save(merged)) as Automerge.Doc<S>;
+  }
+
   // Whether two docs hold the same content, even if their change histories
   // (and therefore their serialized forms) differ
   private statesEqual(a: Automerge.Doc<S>, b: Automerge.Doc<S>): boolean {
@@ -706,7 +721,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       const mergedState = Automerge.load(
         decode(mergedCommit.entry.state) as Uint8Array
       ) as Automerge.Doc<S>;
-      this._state.update(state => Automerge.merge(state, mergedState));
+      this._state.update(state => this.mergeRebuilt(state, mergedState));
 
       this.notifyNewCommit(mergedCommit);
 
