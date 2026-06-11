@@ -202,7 +202,19 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
 
         if (message.payload.type === 'NewCommit') {
           const currentTip = get(this._currentTip);
-          let newCommit = new EntryRecord<Commit>(message.payload.new_commit);
+          const newCommit = new EntryRecord<Commit>(message.payload.new_commit);
+
+          // Merge the commit's state into our local document. The commit
+          // carries the full document, so we converge even when its author
+          // is no longer reachable for an interactive sync.
+          try {
+            const commitState = Automerge.load(
+              decode(newCommit.entry.state) as Uint8Array
+            ) as Automerge.Doc<S>;
+            this._state.update(state => Automerge.merge(state, commitState));
+          } catch (error) {
+            console.error('Failed to merge state from incoming commit:', error);
+          }
 
           if (
             currentTip &&
@@ -211,27 +223,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                 previous_commit.toString() === currentTip.actionHash.toString()
             )
           ) {
-            // We are out of sync with the author of the commit: sync again
+            // The commit doesn't descend from our tip: request a sync so that
+            // the author also learns about our changes
             this.requestSync(message.payload.new_commit.signed_action.hashed.content.author);
-
-            // TODO: This was old merge conflict management, lead to many commits being created
-            // What to do about this?
-
-            // newCommit = await this.workspaceStore.merge([
-            //   currentTip.actionHash,
-            //   newCommit.actionHash,
-            // ]);
-
-            // this.workspaceStore.documentStore.synStore.client.sendMessage(
-            //   Array.from(get(this._participants).keys()),
-            //   {
-            //     workspace_hash: this.workspaceStore.workspaceHash,
-            //     payload: {
-            //       type: 'NewCommit',
-            //       new_commit: newCommit.record,
-            //     },
-            //   }
-            // );
           }
 
           this._currentTip.set(newCommit);
@@ -280,27 +274,32 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       );
 
       this._participants.update(p => {
-        const newParticipants = participants.filter(
-          maybeNew =>
-            !p.has(retype(maybeNew.target, HashType.AGENT)) &&
-            !isEqual(this.myPubKey, retype(maybeNew.target, HashType.AGENT))
-        );
+        for (const link of participants) {
+          const agent = retype(link.target, HashType.AGENT);
+          if (isEqual(this.myPubKey, agent)) continue;
 
-        for (const newParticipant of newParticipants) {
-          p.set(retype(newParticipant.target, HashType.AGENT), {
-            lastSeen: Date.now(),
-            lastActive: undefined,
-            syncStates: {
-              state: Automerge.initSyncState(),
-              ephemeral: Automerge.initSyncState(),
-            },
-          });
-
-          this.requestSync(retype(newParticipant.target, HashType.AGENT));
+          const existing = p.get(agent);
+          if (existing) {
+            // The agent's session link is still in the DHT: count that as
+            // presence so that leader election keeps working even when
+            // remote signals (heartbeats) aren't getting through
+            existing.lastSeen = Date.now();
+            p.set(agent, existing);
+          } else {
+            p.set(agent, {
+              lastSeen: Date.now(),
+              lastActive: undefined,
+              syncStates: {
+                state: Automerge.initSyncState(),
+                ephemeral: Automerge.initSyncState(),
+              },
+            });
+            this.requestSync(agent);
+          }
         }
         return p;
       });
-    }, config.newPeersDiscoveryInterval * 10);
+    }, config.newPeersDiscoveryInterval);
     this.intervals.push(discoveryNewParticipants);
 
     const heartbeatInterval = setInterval(async () => {
@@ -329,29 +328,27 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     this.intervals.push(heartbeatInterval);
 
     const commitInterval = setInterval(async () => {
-      if (
-        this.amILeader() ||
-        (get(this._sessionStatus).lastSave && (Date.now() - new Date(get(this._sessionStatus).lastSave!).getTime()) > 1000 * 60)
-      ) {
+      // The leader (rank 0) commits whenever there are changes. Other
+      // participants only step in when saves have gone stale, each rank
+      // waiting progressively longer so that a single agent takes over
+      // instead of every participant committing on the same tick.
+      const rank = this.leadershipRank();
+      const lastSave = get(this._sessionStatus).lastSave;
+      const staleSaveFallback =
+        rank > 0 &&
+        !!lastSave &&
+        Date.now() - new Date(lastSave).getTime() > 1000 * 60 * rank;
+      if (rank === 0 || staleSaveFallback) {
         this._commitChanges();
-        console.log('Committing changes due to periodic interval');
       } else {
-        const lastSave = await toPromise(this.workspaceStore.tip);
+        const tip = await toPromise(this.workspaceStore.tip);
         const latestSnapshot = await toPromise(this.workspaceStore.latestSnapshot);
-        let inSync = isEqual(
-          Automerge.save(latestSnapshot as Automerge.Doc<S>),
-          Automerge.save(get(this._state))
+        const inSync = this.statesEqual(
+          latestSnapshot as Automerge.Doc<S>,
+          get(this._state)
         );
-
-        // Double check by comparing the full object trees (more expensive)
-        if (!inSync) {
-          inSync = isEqual(
-            Automerge.toJS(latestSnapshot as Automerge.Doc<S>),
-            Automerge.toJS(get(this._state))
-          );
-        }
         const code = inSync ? 'ok' : 'syncing';
-        this._sessionStatus.set({ code, lastSave: (lastSave ? new Date(lastSave.action.timestamp).toISOString() : '') });
+        this._sessionStatus.set({ code, lastSave: (tip ? new Date(tip.action.timestamp).toISOString() : '') });
       }
     }, this.config.commitStrategy.CommitEveryNMs);
     this.intervals.push(commitInterval);
@@ -409,21 +406,18 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     );
   }
 
-  amILeader(): boolean {
+  /** Rank of this agent in the leadership order: 0 means leader */
+  leadershipRank(): number {
     const { active, idle } = get(this.participants);
-    const activeParticipants = [...active, ...idle]
+    const sortedParticipants = [...active, ...idle]
       .map(p => encodeHashToBase64(p))
-      .sort((p1, p2) => {
-        if (p1 < p2) {
-          return -1;
-        }
-        if (p1 > p2) {
-          return 1;
-        }
-        return 0;
-      });
+      .sort();
+    const rank = sortedParticipants.indexOf(encodeHashToBase64(this.myPubKey));
+    return rank === -1 ? sortedParticipants.length : rank;
+  }
 
-    return activeParticipants[0] === encodeHashToBase64(this.myPubKey);
+  amILeader(): boolean {
+    return this.leadershipRank() === 0;
   }
 
   change(updateFn: (state: S, ephemeral: E) => void) {
@@ -624,10 +618,21 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // This is the version public version of commitChanges that will
   // await for any pending commit and issue a commit afterwards.
   async commitChanges(meta?: any) {
-    if (this._previousCommitPromise) await this._previousCommitPromise;
-    this._previousCommitPromise = this.commitChangesInternal(meta);
+    if (this._previousCommitPromise) {
+      try {
+        await this._previousCommitPromise;
+      } catch (error) {
+        // the previous commit failed; still attempt this one
+      }
+    }
+    const commitPromise = this.commitChangesInternal(meta);
+    this._previousCommitPromise = commitPromise;
 
-    return this._previousCommitPromise;
+    try {
+      return await commitPromise;
+    } finally {
+      this._previousCommitPromise = undefined;
+    }
   }
 
   // This is the version of commitChanges that is called by the
@@ -650,15 +655,33 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     }
   }
 
+  // Whether two docs hold the same content, even if their change histories
+  // (and therefore their serialized forms) differ
+  private statesEqual(a: Automerge.Doc<S>, b: Automerge.Doc<S>): boolean {
+    if (isEqual(Automerge.save(a), Automerge.save(b))) return true;
+    return isEqual(Automerge.toJS(a), Automerge.toJS(b));
+  }
+
+  private notifyNewCommit(newCommit: EntryRecord<Commit>) {
+    const otherParticipants = (
+      Array.from(get(this._participants).keys()) as AgentPubKey[]
+    ).filter(p => !isEqual(p, this.myPubKey));
+    this.workspaceStore.documentStore.synStore.client.sendMessage(
+      otherParticipants,
+      {
+        workspace_hash: this.workspaceStore.workspaceHash,
+        payload: {
+          type: 'NewCommit',
+          new_commit: newCommit.record,
+        },
+      }
+    );
+  }
+
   private async commitChangesInternal(meta?: any) {
     const latestSnapshot = await toPromise(this.workspaceStore.latestSnapshot);
 
-    if (
-      isEqual(
-        Automerge.save(latestSnapshot as Automerge.Doc<S>),
-        Automerge.save(get(this._state))
-      )
-    ) {
+    if (this.statesEqual(latestSnapshot as Automerge.Doc<S>, get(this._state))) {
       // Nothing to commit, just return
       return;
     }
@@ -670,13 +693,33 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     // Check if there are multiple workspace tips that need to be merged
     const workspaceTips = await this.workspaceStore.getCurrentTips();
     let currentTip = get(this._currentTip);
-    
+
     if (workspaceTips.length > 1) {
       console.log('Multiple workspace tips detected during session commit, merging:', workspaceTips.map(h => encodeHashToBase64(h)));
       // Merge the tips before creating our commit
       const mergedCommit = await this.workspaceStore.merge(workspaceTips);
       currentTip = mergedCommit;
       this._currentTip.set(mergedCommit);
+
+      // Bring the merged state into our own document; otherwise the commit
+      // below would replace the merge with our pre-merge snapshot
+      const mergedState = Automerge.load(
+        decode(mergedCommit.entry.state) as Uint8Array
+      ) as Automerge.Doc<S>;
+      this._state.update(state => Automerge.merge(state, mergedState));
+
+      this.notifyNewCommit(mergedCommit);
+
+      // If the merge already contains everything we have locally, the merge
+      // commit is the new tip: there is nothing left to commit
+      if (this.statesEqual(mergedState, get(this._state))) {
+        this.deltaCount = 0;
+        this._sessionStatus.set({
+          code: 'ok',
+          lastSave: new Date(mergedCommit.action.timestamp).toISOString(),
+        });
+        return;
+      }
     }
 
     const previous_commit_hashes = currentTip ? [currentTip.actionHash] : [];
@@ -694,22 +737,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
 
     try {
       const newCommit = await this.synClient.createCommit(commit);
-      console.log('New commit created');
 
       this._currentTip.set(newCommit);
-      const otherParticipants = (Array.from(get(this._participants).keys()) as AgentPubKey[]).filter(
-        p => !isEqual(p, this.myPubKey)
-      );
-      this.workspaceStore.documentStore.synStore.client.sendMessage(
-        otherParticipants,
-        {
-          workspace_hash: this.workspaceStore.workspaceHash,
-          payload: {
-            type: 'NewCommit',
-            new_commit: newCommit.record,
-          },
-        }
-      );
+      this.notifyNewCommit(newCommit);
 
       await this.synClient.updateWorkspaceTip(
         this.workspaceStore.workspaceHash,

@@ -1,7 +1,8 @@
 export interface SynConfig {
   heartbeatInterval: number;
-  /** Interval for polling the DHT for new session participants.
-   *  Note: internally multiplied by 10 to determine the actual polling interval. */
+  /** Interval for polling the DHT for session participants. Also refreshes
+   *  the presence (lastSeen) of known participants from their session links,
+   *  so that leader election keeps working when signals don't get through. */
   newPeersDiscoveryInterval: number;
   outOfSessionTimeout: number;
   inactiveSessionThreshold: number;
