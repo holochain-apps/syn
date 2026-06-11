@@ -53,7 +53,7 @@ export class DocumentStore<S, E> {
   /**
    * Keeps an up to date map of all the workspaces for this document
    */
-  allWorkspaces = pipe(
+  allWorkspaces: AsyncReadable<ReadonlyMap<EntryHash, WorkspaceStore<S, E>>> = pipe(
     liveLinksStore(
       this.synStore.client,
       this.documentHash,
@@ -63,16 +63,17 @@ export class DocumentStore<S, E> {
       () => this.synStore.client.getWorkspacesForDocument(this.documentHash,true),
     ),
     links =>
+      // the lazy map constructs entries on demand, so no value is undefined
       slice(
         this.workspaces,
         links.map(l => l.target)
-      )
+      ) as ReadonlyMap<EntryHash, WorkspaceStore<S, E>>
   );
 
   /**
    * Keeps an up to date map of all the commits for this document
    */
-  allCommits = pipe(
+  allCommits: AsyncReadable<ReadonlyMap<ActionHash, AsyncReadable<EntryRecord<Commit>>>> = pipe(
     liveLinksStore(
       this.synStore.client,
       this.documentHash,
@@ -81,7 +82,12 @@ export class DocumentStore<S, E> {
       LINKS_POLL_INTERVAL_MS,
       () => this.synStore.client.getCommitsForDocument(this.documentHash,true),
     ),
-    links => slice(this.commits, uniquify(links.map(l => l.target)))
+    links =>
+      // the lazy map constructs entries on demand, so no value is undefined
+      slice(this.commits, uniquify(links.map(l => l.target))) as ReadonlyMap<
+        ActionHash,
+        AsyncReadable<EntryRecord<Commit>>
+      >
   );
 
   /**

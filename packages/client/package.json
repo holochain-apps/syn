@@ -19,8 +19,8 @@
   },
   "dependencies": {
     "@automerge/automerge": "^3.2.6",
-    "@holochain-open-dev/utils": "^0.601.0",
-    "@holochain/client": "^0.20.4-rc.0",
+    "@holochain-open-dev/utils": "^0.601.1",
+    "@holochain/client": "^0.20.5",
     "@msgpack/msgpack": "^2.7.0"
   },
   "devDependencies": {

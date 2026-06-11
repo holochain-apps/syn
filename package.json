@@ -41,8 +41,8 @@
     "vite-plugin-wasm": "^3.5.0"
   },
   "overrides": {
-    "@holochain/client": "^0.20.4-rc.0",
-    "@holochain-open-dev/utils": "^0.601.0"
+    "@holochain/client": "^0.20.5",
+    "@holochain-open-dev/utils": "^0.601.1"
   },
   "eslintConfig": {
     "extends": ["@open-wc/eslint-config", "eslint-config-prettier"]

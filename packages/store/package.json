@@ -19,10 +19,10 @@
   },
   "dependencies": {
     "@automerge/automerge": "^3.2.6",
-    "@holochain-open-dev/stores": "^0.601.0",
-    "@holochain-open-dev/utils": "^0.601.0",
+    "@holochain-open-dev/stores": "^0.601.1",
+    "@holochain-open-dev/utils": "^0.601.1",
     "@holochain-syn/client": "^0.601.3",
-    "@holochain/client": "^0.20.4-rc.0",
+    "@holochain/client": "^0.20.5",
     "@msgpack/msgpack": "^2.7.2",
     "lodash-es": "^4.17.21"
   },

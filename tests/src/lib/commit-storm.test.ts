@@ -1,6 +1,6 @@
 import { assert, test } from 'vitest';
 
-import { dhtSync, runScenario } from '@holochain/tryorama';
+import { dhtSync, runScenario } from '@holochain-open-dev/tryorama';
 
 import { get } from '@holochain-open-dev/stores';
 import { SynStore, stateFromCommit } from '@holochain-syn/store';

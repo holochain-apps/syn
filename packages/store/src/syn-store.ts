@@ -1,4 +1,5 @@
 import {
+  AsyncReadable,
   liveLinksStore,
   pipe,
   retryUntilSuccess,
@@ -44,7 +45,8 @@ export class SynStore {
   /**
    * Keeps an up to date array of the entry hashes for all the roots in this network
    */
-  documentsByTag = new LazyMap((tag: string) =>
+  documentsByTag = new LazyMap(
+    (tag: string): AsyncReadable<ReadonlyMap<EntryHash, DocumentStore<any, any>>> =>
     pipe(
       this.tagsEntryHash.get(tag),
       tagPathEntryHash =>
@@ -56,7 +58,12 @@ export class SynStore {
           LINKS_POLL_INTERVAL_MS,
           this.localOnly ? undefined : () => this.client.getDocumentsWithTag(tag, true), // Don't do initial local fetch if localOnly
         ),
-      links => slice(this.documents, uniquify(links.map(l => l.target)))
+      links =>
+        // the lazy map constructs entries on demand, so no value is undefined
+        slice(this.documents, uniquify(links.map(l => l.target))) as ReadonlyMap<
+          EntryHash,
+          DocumentStore<any, any>
+        >
     )
   );
 
