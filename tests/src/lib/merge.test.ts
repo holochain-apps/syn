@@ -114,9 +114,13 @@ test('check that the state of disconnected agents making changes converges after
     const aliceAppWs = await alice.conductor.connectAppWs(issued.token, port);
     await scenario.shareAllAgents();
     console.log('Alice conductor started up');
-    // Syncing after the conductor restart can take a while (ops re-validate),
-    // so allow more than the default 40s before giving up
-    await dhtSync([alice, bob], alice.cells[0].cell_id[0], 500, 120000);
+    // Syncing after a conductor restart is slow because of a kitsune2 0.4.1
+    // gossip limitation: Alice's restarted endpoint gets a new iroh node id,
+    // and Bob's serial gossip-initiate loop blocks for connect_timeout (60s,
+    // retried) dialing her dead pre-restart URL from the bootstrap server.
+    // Gossip with the live Alice only proceeds in the gaps between those
+    // blocking dials, so first sync lands shortly after the ~120s mark.
+    await dhtSync([alice, bob], alice.cells[0].cell_id[0], 500, 300000);
     console.log('DHT sync done');
     aliceSyn = new SynStore(new SynClient(aliceAppWs, 'syn-test'));
     aliceDocumentStore = aliceSyn.documents.get(
