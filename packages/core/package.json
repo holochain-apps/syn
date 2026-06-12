@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/core",
-  "version": "0.601.3",
+  "version": "0.601.4",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "type": "module",
@@ -14,13 +14,13 @@
     "build:watch": "tsc -w --preserveWatchOutput"
   },
   "dependencies": {
-    "@holochain-open-dev/elements": "^0.601.0",
+    "@holochain-open-dev/elements": "^0.601.2",
     "@holochain-open-dev/profiles": "^0.601.4",
-    "@holochain-open-dev/stores": "^0.601.1",
-    "@holochain-open-dev/utils": "^0.601.1",
+    "@holochain-open-dev/stores": "^0.601.2",
+    "@holochain-open-dev/utils": "^0.601.2",
     "@holochain/client": "^0.20.5",
-    "@holochain-syn/client": "^0.601.3",
-    "@holochain-syn/store": "^0.601.3",
+    "@holochain-syn/client": "^0.601.4",
+    "@holochain-syn/store": "^0.601.4",
     "@lit/context": "^1.0.0",
     "@lit/localize": "^0.12.0",
     "@scoped-elements/cytoscape": "^0.2.0",

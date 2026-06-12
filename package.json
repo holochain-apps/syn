@@ -42,7 +42,7 @@
   },
   "overrides": {
     "@holochain/client": "^0.20.5",
-    "@holochain-open-dev/utils": "^0.601.1"
+    "@holochain-open-dev/utils": "^0.601.2"
   },
   "eslintConfig": {
     "extends": ["@open-wc/eslint-config", "eslint-config-prettier"]

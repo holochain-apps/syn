@@ -6,7 +6,7 @@
   },
   "dependencies": {
     "@holochain-open-dev/profiles": "^0.601.4",
-    "@holochain-open-dev/stores": "^0.601.1",
+    "@holochain-open-dev/stores": "^0.601.2",
     "@holochain-syn/core": "file:../packages/core",
     "@holochain-syn/text-editor": "file:../packages/text-editor",
     "@holochain/client": "^0.20.5",
