@@ -76,10 +76,19 @@ export function applyAvailableChanges<T>(
     return { doc, appliedCount: 0, deferred: [] };
   }
 
-  const decoded = changes.map(bytes => {
-    const { hash, deps } = Automerge.decodeChange(bytes);
-    return { bytes, hash, deps };
-  });
+  // Decode per change so one malformed entry (this is the network boundary:
+  // change bytes come from arbitrary peers) discards only itself, not the
+  // valid changes traveling in the same batch
+  const decoded: Array<{ bytes: Uint8Array; hash: string; deps: string[] }> =
+    [];
+  for (const bytes of changes) {
+    try {
+      const { hash, deps } = Automerge.decodeChange(bytes);
+      decoded.push({ bytes, hash, deps });
+    } catch (error) {
+      console.error('syn: dropping undecodable remote change:', error);
+    }
+  }
 
   // Deduplicate within the batch
   const byHash = new Map<string, { bytes: Uint8Array; hash: string; deps: string[] }>();
@@ -88,22 +97,28 @@ export function applyAvailableChanges<T>(
   }
 
   // A dependency is satisfied when the doc's history has it or another
-  // selected change in the batch provides it. One getMissingDeps call tells
-  // us which of all referenced hashes the doc does NOT have.
+  // selected change in the batch provides it. One getMissingDeps call —
+  // over the deps and the candidates' own hashes — tells us which of all
+  // referenced hashes the doc does NOT have.
+  const candidateHashes = [...byHash.keys()];
   const allDeps = [...new Set([...byHash.values()].flatMap(c => c.deps))];
-  const missingFromDoc = new Set(Automerge.getMissingDeps(doc, allDeps));
+  const missingFromDoc = new Set(
+    Automerge.getMissingDeps(doc, [...allDeps, ...candidateHashes])
+  );
   const inHistory = (hash: string) => !missingFromDoc.has(hash);
 
-  // Changes the doc already has need no special-casing: applyChanges treats
-  // a duplicate as a no-op, so selecting them is harmless
   const selected = new Map<string, { bytes: Uint8Array; deps: string[] }>();
 
-  // Greedy fixpoint: keep admitting changes whose deps are all satisfied
+  // Greedy fixpoint: keep admitting changes whose deps are all satisfied.
+  // Changes already in the doc's history are skipped up front: applying
+  // them would be a no-op, and skipping means a duplicate-only batch (the
+  // common broadcast/sync overlap) returns the input doc unchanged instead
+  // of paying a clone-and-swap that notifies every subscriber.
   let progress = true;
   while (progress) {
     progress = false;
     for (const [hash, c] of byHash) {
-      if (selected.has(hash)) continue;
+      if (selected.has(hash) || inHistory(hash)) continue;
       if (c.deps.every(d => inHistory(d) || selected.has(d))) {
         selected.set(hash, c);
         progress = true;
@@ -111,8 +126,11 @@ export function applyAvailableChanges<T>(
     }
   }
 
+  // Neither applied nor already known: waiting on dependencies. In-history
+  // duplicates must not land here or they'd cycle through the caller's
+  // pending buffer forever.
   const deferred = [...byHash.values()]
-    .filter(c => !selected.has(c.hash))
+    .filter(c => !selected.has(c.hash) && !inHistory(c.hash))
     .map(c => c.bytes);
 
   if (selected.size === 0) {
@@ -126,8 +144,8 @@ export function applyAvailableChanges<T>(
     [...selected.values()].map(c => c.bytes)
   );
   // The selected set is dependency-closed, so nothing can have parked; a
-  // violation here means the dependency reasoning above is wrong — fall
-  // back to a clean clone rather than returning a doc that breaks the
+  // violation here means the dependency reasoning above is wrong — rebuild
+  // from history rather than returning a doc that breaks the
   // no-parked-changes invariant
   const result = hasParkedChanges(applied) ? stripParked(applied) : applied;
   return { doc: result, appliedCount: selected.size, deferred };

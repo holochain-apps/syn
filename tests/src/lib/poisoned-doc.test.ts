@@ -173,9 +173,11 @@ test(
         }
       }
 
-      // Diagnostics on the LIVE docs (the public state getter clones, which
-      // drops parked changes — read the internal store directly): confirm
-      // the parked-changes precondition actually forms during the storm
+      // Diagnostics on the LIVE docs. Parked changes survive clone (and
+      // save/load), so probing the public state getter's clone would work
+      // too — but reading the internal store is the direct measurement of
+      // the handle whose poisoning kills the session, with no intermediate
+      // operation that could itself be affected.
       let maxParkedBob = 0;
       let maxParkedAlice = 0;
       const probe = setInterval(() => {

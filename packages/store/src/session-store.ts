@@ -905,6 +905,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         'syn: failed to apply remote changes; live document unchanged, converging via sync:',
         error
       );
+      // Keep the buffer pruned of expired entries even on the failure path
+      this._pendingRemoteChanges = kept;
       if (from) this.requestSync(from);
     }
   }
