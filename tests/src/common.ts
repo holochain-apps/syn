@@ -1,5 +1,6 @@
 import { AgentPubKey } from '@holochain/client';
 import { SessionStore } from '@holochain-syn/store';
+import { get } from '@holochain-open-dev/stores';
 
 import {
   TextEditorEphemeralState,
@@ -77,6 +78,32 @@ export const sampleGrammar = {
     };
   },
 };
+
+/** Prove the session's live document is still operable: a poisoned wasm
+ *  handle (automerge panic mid-operation) throws "recursive use of an object
+ *  detected" on any further read or write. Performs a content-neutral
+ *  write+revert, a state read, and checks the session status. */
+export function assertSessionHealthy(
+  store: SessionStore<any, any>,
+  pubKey: AgentPubKey,
+  label = 'session'
+) {
+  try {
+    get(store.state);
+    store.change((state: any, eph: any) =>
+      textEditorGrammar.changes(pubKey, state.body, eph).insert(0, ' ')
+    );
+    store.change((state: any, eph: any) =>
+      textEditorGrammar.changes(pubKey, state.body, eph).delete(0, 1)
+    );
+  } catch (e) {
+    throw new Error(`${label} document is poisoned or unusable: ${e}`);
+  }
+  const status = get(store.sessionStatus);
+  if (status.code === 'error') {
+    throw new Error(`${label} status is 'error'`);
+  }
+}
 
 export function waitForOtherParticipants(
   sessionStore: SessionStore<any, any>,
