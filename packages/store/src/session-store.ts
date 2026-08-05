@@ -763,18 +763,40 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           updateFn(doc as S, eph as E);
         });
       });
+    } catch (error) {
+      // The transaction rolled back and the live documents are untouched;
+      // rethrow so a throwing grammar updateFn still surfaces to the caller
+      console.error('syn: change failed; live document unchanged:', error);
+      throw error;
+    }
+    // The transactions committed on the live handles: the stores MUST be
+    // re-pointed at the new proxies before anything else that can throw,
+    // or they'd be left holding outdated proxies that fail every later
+    // change with "Attempting to change an outdated document"
+    this._state.set(newState);
+    this._ephemeral.set(newEphemeralState!);
+
+    try {
       stateChanges = Automerge.getChanges(state, newState);
       ephemeralChanges = Automerge.getChanges(
         ephemeralState,
         newEphemeralState!
       );
     } catch (error) {
-      // Rethrow so a throwing grammar updateFn still surfaces to the caller
-      console.error('syn: change failed; live document unchanged:', error);
-      throw error;
+      // ChangeCollector failure after a committed edit: the stores are
+      // current but the change bytes can't be extracted for broadcast;
+      // peers converge through the commit and sync machinery instead
+      console.error(
+        'syn: failed to extract committed changes for broadcast:',
+        error
+      );
+      if (this._divergedSince === undefined) this._divergedSince = Date.now();
+      this._sessionStatus.set({
+        code: 'syncing',
+        lastSave: get(this.sessionStatus).lastSave,
+      });
+      return;
     }
-    this._state.set(newState);
-    this._ephemeral.set(newEphemeralState!);
 
     this.deltaCount += stateChanges.length;
     if (stateChanges.length > 0 && this._divergedSince === undefined) {
@@ -904,8 +926,12 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         this.requestSync(from);
       }
     } catch (error) {
+      // No newer proxy exists to re-point the store at (applyChanges
+      // yields one only on success); a mid-apply wasm failure may still
+      // have advanced the handle, in which case later operations surface
+      // it and the sync channel is the recovery path either way
       console.error(
-        'syn: failed to apply remote changes; live document unchanged, converging via sync:',
+        'syn: failed to apply remote changes; converging via sync:',
         error
       );
       // Keep the buffer pruned of expired entries even on the failure path
@@ -991,6 +1017,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     let stateAdvanced = false;
     if (syncMessage) {
       const state = get(this._state);
+      let next: Automerge.Doc<S> | undefined;
       try {
         // In place: wasm docs are never GC-reclaimed, so a clone per sync
         // round leaks permanently. Failure containment is the catch below.
@@ -1002,29 +1029,32 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           );
         // Defensive: the sync protocol shouldn't deliver changes with
         // missing dependencies, but a doc that internally parks them is
-        // one MissingOps panic away from being poisoned (automerge#1327);
-        // stripParked is a no-op check on a clean doc, and on the rare
-        // rebuild the superseded handle is released explicitly
-        let next = nextDoc;
-        if (hasParkedChanges(nextDoc)) {
-          next = stripParked(nextDoc);
-          freeDoc(nextDoc);
-        }
+        // one MissingOps panic away from being poisoned (automerge#1327).
+        // stripParked is a cheap check on a clean doc. On the rare rebuild
+        // the superseded handle — until a moment ago the LIVE doc's handle
+        // (receiveSyncMessage ran in place) — is deliberately NOT freed:
+        // an async reader may still hold a proxy of it, and a bounded leak
+        // on a should-never-happen path beats a use-after-free.
+        next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
         const changes = Automerge.getChanges(state, next);
+        participantInfo.syncStates.state = nextSyncState;
+        this._state.set(next);
         this.deltaCount += changes.length;
         if (changes.length > 0 && this._divergedSince === undefined) {
           this._divergedSince = Date.now();
         }
-        participantInfo.syncStates.state = nextSyncState;
-        this._state.set(next);
         stateAdvanced = changes.length > 0;
       } catch (error) {
         // The half-advanced sync state is untrustworthy after a failure;
-        // restarting the conversation costs one extra negotiation round
+        // restarting the conversation costs one extra negotiation round.
+        // receiveSyncMessage ran in place, so when a newer valid proxy
+        // exists the store must be re-pointed at it — otherwise the store
+        // keeps an outdated proxy and every later operation throws.
         console.error(
-          'syn: receiveSyncMessage failed; live document unchanged, restarting sync:',
+          'syn: sync receive failed; restarting sync with peer:',
           error
         );
+        if (next !== undefined) this._state.set(next);
         participantInfo.syncStates.state = Automerge.initSyncState();
         this._sessionStatus.set({
           code: 'syncing',
@@ -1035,6 +1065,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
 
     if (ephemeralSyncMessage) {
       const ephemeral = get(this._ephemeral);
+      let next: Automerge.Doc<E> | undefined;
       try {
         const [nextDoc, nextSyncState, _message] =
           Automerge.receiveSyncMessage(
@@ -1043,17 +1074,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
             ephemeralSyncMessage
           );
         participantInfo.syncStates.ephemeral = nextSyncState;
-        let next = nextDoc;
-        if (hasParkedChanges(nextDoc)) {
-          next = stripParked(nextDoc);
-          freeDoc(nextDoc);
-        }
+        // see the state branch above for why the superseded handle is not
+        // freed on the rare strip path
+        next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
         this._ephemeral.set(next);
       } catch (error) {
         console.error(
-          'syn: ephemeral receiveSyncMessage failed; restarting sync:',
+          'syn: ephemeral sync receive failed; restarting sync:',
           error
         );
+        if (next !== undefined) this._ephemeral.set(next);
         participantInfo.syncStates.ephemeral = Automerge.initSyncState();
       }
     }
@@ -1271,8 +1301,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       // not. Compute the delta on a clone so a panic poisons only the
       // throwaway doc and never the live session document, and fall back to
       // a full snapshot when it can't produce a clean delta.
+      let clone: Automerge.Doc<S> | undefined;
       try {
-        const clone = Automerge.clone(
+        clone = Automerge.clone(
           stateAtCommit,
           Automerge.getActorId(stateAtCommit)
         );
@@ -1290,6 +1321,10 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           error
         );
         newDepth = 0;
+      } finally {
+        // one full-doc clone per delta commit would otherwise leak
+        // permanently (wasm docs are never GC-reclaimed)
+        if (clone !== undefined) freeDoc(clone);
       }
     }
     if (!payload) {
@@ -1369,6 +1404,12 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     for (const interval of this.intervals) {
       clearInterval(interval);
     }
+    // The session is finished: release its live documents (wasm docs are
+    // never GC-reclaimed, so join/leave cycles would otherwise accumulate
+    // a doc per session). Using this store after leaveSession is invalid.
+    freeDoc(get(this._state));
+    freeDoc(get(this._ephemeral));
+    this._pendingRemoteChanges = [];
     this.onLeave();
   }
 

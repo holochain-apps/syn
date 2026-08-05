@@ -61,7 +61,12 @@ export function stripParked<T>(doc: Automerge.Doc<T>): Automerge.Doc<T> {
 }
 
 export interface SafeApplyResult<T> {
-  /** Free of parked changes; the input doc unchanged when nothing applied */
+  /** Free of parked changes. Identical to the input doc when nothing was
+   *  applied. When appliedCount > 0, this is the successor proxy of the
+   *  input's wasm handle (the apply ran in place — the input proxy is
+   *  stale and the caller must swap to this one). On the rare
+   *  parked-fallback rebuild, this is a NEW handle and the input's handle
+   *  is superseded but not freed (see comment at the fallback). */
   doc: Automerge.Doc<T>;
   appliedCount: number;
   /** Change bytes whose dependencies are not present yet; hold and retry */
@@ -156,11 +161,14 @@ export function applyAvailableChanges<T>(
   );
   // The selected set is dependency-closed, so nothing can have parked; a
   // violation here means the dependency reasoning above is wrong — rebuild
-  // from history (and release the tainted handle) rather than returning a
-  // doc that breaks the no-parked-changes invariant
+  // from history rather than returning a doc that breaks the
+  // no-parked-changes invariant. The input handle (the apply ran in place,
+  // so `applied` shares it) is superseded but deliberately NOT freed: the
+  // caller's input is typically a live store doc whose proxies async
+  // readers may still hold, and a bounded leak on this should-never-happen
+  // path beats a use-after-free.
   if (hasParkedChanges(applied)) {
     const rebuilt = stripParked(applied);
-    freeDoc(applied);
     return { doc: rebuilt, appliedCount: selected.size, deferred };
   }
   return { doc: applied, appliedCount: selected.size, deferred };

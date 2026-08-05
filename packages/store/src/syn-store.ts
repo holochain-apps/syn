@@ -23,6 +23,7 @@ class LazyMap<K, V> {
 import { DocumentStore } from './document-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
 import { decodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
 
 export const stateFromCommit = (commit: Commit) => {
   const payload = decodeCommitPayload(commit.state);
@@ -87,10 +88,12 @@ export class SynStore {
 
   async createDocument<S extends Record<string, unknown>>(initialState: S, meta?: any) {
     let doc: Automerge.Doc<any> = Automerge.from(initialState);
+    const initialStateBytes = encode(Automerge.save(doc));
+    freeDoc(doc);
 
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
-      initial_state: encode(Automerge.save(doc)),
+      initial_state: initialStateBytes,
     });
 
     return this.documents.get(documentRecord.actionHash);
@@ -104,10 +107,12 @@ export class SynStore {
     doc = Automerge.change(doc, { time: 0 }, d =>
       Object.assign(d, initialState)
     );
+    const initialStateBytes = encode(Automerge.save(doc));
+    freeDoc(doc);
 
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
-      initial_state: encode(Automerge.save(doc)),
+      initial_state: initialStateBytes,
     });
 
     return this.documents.get(documentRecord.entryHash);

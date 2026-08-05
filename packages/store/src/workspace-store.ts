@@ -26,6 +26,7 @@ import { DocumentStore } from './document-store.js';
 import { SessionStore } from './session-store.js';
 import { stateFromDocument } from './syn-store.js';
 import { encodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
 
 /** Sorts hashes by their base64 encoding, the canonical order shared by all agents */
 export const sortHashes = (hashes: Array<ActionHash>): Array<ActionHash> =>
@@ -228,7 +229,15 @@ export class WorkspaceStore<S, E> {
     }
     // Rebuild through a save/load round-trip: canonicalizes the document and
     // works around automerge#1327 (index gaps after merge)
+    const preRoundTrip = mergeState;
     mergeState = Automerge.load(Automerge.save(mergeState)) as Automerge.Doc<S>;
+    // All merge inputs are locally resolved docs; release them and the
+    // pre-round-trip handle (merge reuses resolvableStates[0]'s handle) —
+    // wasm docs are never GC-reclaimed
+    freeDoc(preRoundTrip);
+    for (let i = 1; i < resolvableStates.length; i++) {
+      freeDoc(resolvableStates[i]);
+    }
 
     const documentHash = this.documentStore.documentHash;
 
@@ -255,6 +264,9 @@ export class WorkspaceStore<S, E> {
       witnesses: [],
       document_hash: documentHash,
     };
+
+    // the merged state is fully serialized into the commit entry above
+    freeDoc(mergeState);
 
     const newCommit = await this.documentStore.synStore.client.createCommit(
       commit

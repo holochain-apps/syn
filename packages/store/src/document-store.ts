@@ -26,6 +26,7 @@ import { SynStore } from './syn-store.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
 import { decodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
 
 export function sliceStrings<K extends string, V>(
   map: GetonlyMap<K, V>,
@@ -155,8 +156,12 @@ export class DocumentStore<S, E> {
         if (deltas.length > 0) {
           // Rebuild through a save/load round-trip: incremental loads can
           // leave the doc in an internal state that makes later changes
-          // panic in the wasm module (automerge#1327)
+          // panic in the wasm module (automerge#1327). Release the
+          // pre-round-trip handle (loadIncremental reuses the initial
+          // load's handle) — wasm docs are never GC-reclaimed.
+          const preRoundTrip = doc;
           doc = Automerge.load(Automerge.save(doc));
+          freeDoc(preRoundTrip);
         }
         return doc;
       }
