@@ -3,7 +3,7 @@ import { assert, test } from 'vitest';
 import { dhtSync, runScenario } from '@holochain-open-dev/tryorama';
 
 import { get, toPromise } from '@holochain-open-dev/stores';
-import { SynStore } from '@holochain-syn/store';
+import { freeDoc, SynStore } from '@holochain-syn/store';
 import { SynClient } from '@holochain-syn/client';
 import { AppBundleSource } from '@holochain/client';
 import { encode } from '@msgpack/msgpack';
@@ -159,6 +159,13 @@ test(
           const cA = Automerge.getChanges(prevA, branchA)[0];
           const cB = Automerge.getChanges(prevB, branchB)[0];
           const cTop = Automerge.getChanges(merged, top)[0];
+          // wasm docs are never GC-reclaimed; release the phantom scaffolding
+          // (top/branchA/branchB are the live wrappers of the merged/prevA/
+          // prevB handles respectively)
+          freeDoc(top);
+          freeDoc(branchA);
+          freeDoc(branchB);
+          freeDoc(base);
 
           // deps-last to bob: the diamond top parks with two missing deps
           await sendChanges(aliceSyn, bob.agentPubKey, [cTop]);

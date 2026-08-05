@@ -27,6 +27,8 @@ import {
 } from './commit-payload.js';
 import {
   applyAvailableChanges,
+  freeDoc,
+  hasParkedChanges,
   rebuildConsistent,
   stripParked,
 } from './automerge-safe.js';
@@ -334,6 +336,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                 const next = Automerge.load(Automerge.save(applied), {
                   actor,
                 }) as Automerge.Doc<S>;
+                // the clone+loadIncremental intermediate is superseded by
+                // the round-tripped doc; wasm docs are never GC-reclaimed
+                freeDoc(applied);
                 if (!this.headsInHistory(next, commitHeads)) {
                   // The delta references history we don't have. Don't adopt
                   // the tip; converge through an interactive sync with the
@@ -353,6 +358,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                           doc as Automerge.Doc<S>
                         )
                       );
+                      freeDoc(doc as Automerge.Doc<S>);
                       this.drainPendingRemoteChanges();
                       void this.updateSyncStatus();
                     })
@@ -363,7 +369,12 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   void this.updateSyncStatus();
                   return;
                 }
-                this._state.set(stripParked(next));
+                let adopted = next;
+                if (hasParkedChanges(next)) {
+                  adopted = stripParked(next);
+                  freeDoc(next);
+                }
+                this._state.set(adopted);
                 this.drainPendingRemoteChanges();
               }
             } else {
@@ -381,6 +392,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   Automerge.clone(state, Automerge.getActorId(state)),
                   commitState
                 );
+                freeDoc(commitState);
                 this._state.set(next);
                 this.drainPendingRemoteChanges();
               }
@@ -734,39 +746,30 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     const state = get(this._state);
     const ephemeralState = get(this._ephemeral);
 
-    // Open the transactions on actor-preserving clones, never on the live
-    // handles: a wasm panic mid-transaction (automerge#1327) leaves the
-    // handle it ran on permanently unusable, and on a clone that only
-    // costs us this one change instead of the whole session. The live doc
-    // doesn't advance between clone and swap, so keeping the actor id is
-    // safe and the history stays linear.
+    // The transaction runs in place on the live handle: automerge wasm
+    // documents are never reclaimed by the JS GC, so a clone per keystroke
+    // leaks its full doc size permanently and kills the module at the wasm
+    // memory cap. Panic safety comes from the no-parked-changes invariant
+    // (the panic precondition never forms) plus the catch below — a plain
+    // throw from the grammar's updateFn rolls back cleanly and leaves the
+    // live doc untouched.
     let newState: Automerge.Doc<S>;
     let newEphemeralState: Automerge.Doc<E> | undefined;
     let stateChanges: Uint8Array[];
     let ephemeralChanges: Uint8Array[];
     try {
-      newState = Automerge.change(
-        Automerge.clone(state, Automerge.getActorId(state)),
-        doc => {
-          newEphemeralState = Automerge.change(
-            Automerge.clone(
-              ephemeralState,
-              Automerge.getActorId(ephemeralState)
-            ),
-            eph => {
-              updateFn(doc as S, eph as E);
-            }
-          );
-        }
-      );
+      newState = Automerge.change(state, doc => {
+        newEphemeralState = Automerge.change(ephemeralState, eph => {
+          updateFn(doc as S, eph as E);
+        });
+      });
       stateChanges = Automerge.getChanges(state, newState);
       ephemeralChanges = Automerge.getChanges(
         ephemeralState,
         newEphemeralState!
       );
     } catch (error) {
-      // The live documents are untouched; rethrow so a throwing grammar
-      // updateFn still surfaces to the caller
+      // Rethrow so a throwing grammar updateFn still surfaces to the caller
       console.error('syn: change failed; live document unchanged:', error);
       throw error;
     }
@@ -924,24 +927,21 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     const syncStates = participantEntry.syncStates;
 
     // generateSyncMessage reconstructs changes by hash (the ChangeCollector
-    // path that can panic, automerge#1327); run it against clones so a
-    // panic costs this sync round, not the live documents
+    // path that can panic, automerge#1327). It reads without mutating, the
+    // no-parked-changes invariant keeps its panic precondition away, and a
+    // clone here would leak permanently (wasm docs are never GC-reclaimed)
+    // — so run it on the live docs and contain failures with the catch.
     let nextSyncState: Automerge.SyncState;
     let syncMessage: Uint8Array | null;
     let ephemeralNextSyncState: Automerge.SyncState;
     let ephemeralSyncMessage: Uint8Array | null;
     try {
-      const state = get(this._state);
-      const ephemeral = get(this._ephemeral);
       [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
-        Automerge.clone(state, Automerge.getActorId(state)),
+        get(this._state),
         syncStates.state
       );
       [ephemeralNextSyncState, ephemeralSyncMessage] =
-        Automerge.generateSyncMessage(
-          Automerge.clone(ephemeral, Automerge.getActorId(ephemeral)),
-          syncStates.ephemeral
-        );
+        Automerge.generateSyncMessage(get(this._ephemeral), syncStates.ephemeral);
     } catch (error) {
       // Skip this round; the periodic machinery (discovery polls,
       // heartbeats, commit flow) retries syncing soon after
@@ -992,19 +992,24 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     if (syncMessage) {
       const state = get(this._state);
       try {
-        // Receive on an actor-preserving clone and swap on success: a wasm
-        // failure mid-receive must cost us the clone, not the live doc
+        // In place: wasm docs are never GC-reclaimed, so a clone per sync
+        // round leaks permanently. Failure containment is the catch below.
         const [nextDoc, nextSyncState, _message] =
           Automerge.receiveSyncMessage(
-            Automerge.clone(state, Automerge.getActorId(state)),
+            state,
             participantInfo.syncStates.state,
             syncMessage
           );
         // Defensive: the sync protocol shouldn't deliver changes with
         // missing dependencies, but a doc that internally parks them is
         // one MissingOps panic away from being poisoned (automerge#1327);
-        // stripParked is a no-op on a clean doc
-        const next = stripParked(nextDoc);
+        // stripParked is a no-op check on a clean doc, and on the rare
+        // rebuild the superseded handle is released explicitly
+        let next = nextDoc;
+        if (hasParkedChanges(nextDoc)) {
+          next = stripParked(nextDoc);
+          freeDoc(nextDoc);
+        }
         const changes = Automerge.getChanges(state, next);
         this.deltaCount += changes.length;
         if (changes.length > 0 && this._divergedSince === undefined) {
@@ -1033,12 +1038,17 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       try {
         const [nextDoc, nextSyncState, _message] =
           Automerge.receiveSyncMessage(
-            Automerge.clone(ephemeral, Automerge.getActorId(ephemeral)),
+            ephemeral,
             participantInfo.syncStates.ephemeral,
             ephemeralSyncMessage
           );
         participantInfo.syncStates.ephemeral = nextSyncState;
-        this._ephemeral.set(stripParked(nextDoc));
+        let next = nextDoc;
+        if (hasParkedChanges(nextDoc)) {
+          next = stripParked(nextDoc);
+          freeDoc(nextDoc);
+        }
+        this._ephemeral.set(next);
       } catch (error) {
         console.error(
           'syn: ephemeral receiveSyncMessage failed; restarting sync:',
@@ -1102,11 +1112,17 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // with internal index gaps that later make change commits or
   // sync-message generation panic inside the wasm module
   // (https://github.com/automerge/automerge/issues/1327).
+  // Both call sites pass a caller-owned clone as `doc`; the merged handle
+  // is superseded by the rebuilt doc and released here (wasm docs are
+  // never GC-reclaimed).
   private mergeRebuilt(
     doc: Automerge.Doc<S>,
     other: Automerge.Doc<S>
   ): Automerge.Doc<S> {
-    return rebuildConsistent(Automerge.merge(doc, other));
+    const merged = Automerge.merge(doc, other);
+    const rebuilt = rebuildConsistent(merged);
+    freeDoc(merged);
+    return rebuilt;
   }
 
   // Whether two docs hold the same content, even if their change histories
@@ -1199,6 +1215,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         );
         this._state.set(next);
       }
+      freeDoc(mergedState);
 
       currentTip = mergedCommit;
       this._currentTip.set(mergedCommit);

@@ -51,7 +51,12 @@ export function stripParked<T>(doc: Automerge.Doc<T>): Automerge.Doc<T> {
   try {
     return rebuildFromHistory(doc);
   } catch (e) {
-    return rebuildFromHistory(rebuildConsistent(doc));
+    const consistent = rebuildConsistent(doc);
+    try {
+      return rebuildFromHistory(consistent);
+    } finally {
+      freeDoc(consistent);
+    }
   }
 }
 
@@ -66,8 +71,16 @@ export interface SafeApplyResult<T> {
 /** Apply only the changes whose dependencies the doc already has (directly
  *  or via other changes in the batch); return the rest as `deferred` instead
  *  of letting applyChanges park them inside the doc. Duplicates already in
- *  the doc's history are dropped. The work happens on a clone, so the input
- *  doc survives untouched even if the wasm module panics mid-apply. */
+ *  the doc's history are dropped.
+ *
+ *  The selection runs entirely in JS (decode + one getMissingDeps call);
+ *  the apply then runs IN PLACE on the doc's handle. In place matters:
+ *  automerge wasm documents are never reclaimed by the JS garbage
+ *  collector (verified against 3.4.0 — forced GC frees nothing and the
+ *  module aborts at its 4GB cap after ~4000 leaked clones of a 20k-char
+ *  doc), so a clone-per-call pattern on a hot path is a guaranteed OOM.
+ *  Applying a dependency-closed batch cannot park anything, which is what
+ *  keeps the ChangeCollector panic precondition (automerge#1327) away. */
 export function applyAvailableChanges<T>(
   doc: Automerge.Doc<T>,
   changes: Uint8Array[]
@@ -137,16 +150,31 @@ export function applyAvailableChanges<T>(
     return { doc, appliedCount: 0, deferred };
   }
 
-  const actor = Automerge.getActorId(doc);
-  const clone = Automerge.clone(doc, actor);
   const [applied] = Automerge.applyChanges(
-    clone,
+    doc,
     [...selected.values()].map(c => c.bytes)
   );
   // The selected set is dependency-closed, so nothing can have parked; a
   // violation here means the dependency reasoning above is wrong — rebuild
-  // from history rather than returning a doc that breaks the
-  // no-parked-changes invariant
-  const result = hasParkedChanges(applied) ? stripParked(applied) : applied;
-  return { doc: result, appliedCount: selected.size, deferred };
+  // from history (and release the tainted handle) rather than returning a
+  // doc that breaks the no-parked-changes invariant
+  if (hasParkedChanges(applied)) {
+    const rebuilt = stripParked(applied);
+    freeDoc(applied);
+    return { doc: rebuilt, appliedCount: selected.size, deferred };
+  }
+  return { doc: applied, appliedCount: selected.size, deferred };
+}
+
+/** Release a wasm document's memory immediately. The JS GC never reclaims
+ *  automerge documents, so every doc that stops being referenced without
+ *  an explicit free leaks its full wasm-side size permanently. Only call
+ *  on docs with clearly local ownership — using a freed doc (or any stale
+ *  wrapper of it) afterwards throws from the wasm boundary. */
+export function freeDoc(doc: Automerge.Doc<unknown>): void {
+  try {
+    Automerge.free(doc);
+  } catch (e) {
+    // double-free or an already-invalid handle: nothing to release
+  }
 }
