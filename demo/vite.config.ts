@@ -6,5 +6,10 @@ export default defineConfig({
   optimizeDeps: {
     disabled: true,
   },
+  // vite-plugin-wasm emits a top-level await for the wasm module init,
+  // which the default build target rejects
+  build: {
+    target: 'esnext',
+  },
   plugins: [svelte(), wasm()],
 });
