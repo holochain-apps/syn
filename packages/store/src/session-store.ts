@@ -25,6 +25,18 @@ import {
   decodeCommitPayload,
   encodeCommitPayload,
 } from './commit-payload.js';
+import {
+  applyAvailableChanges,
+  rebuildConsistent,
+  stripParked,
+} from './automerge-safe.js';
+
+// Bounds for the buffer of remote changes whose dependencies haven't
+// arrived yet (see _pendingRemoteChanges). Expired or overflowing entries
+// are simply dropped: the sync protocol and the commit flow re-deliver
+// anything that matters.
+const MAX_PENDING_REMOTE_CHANGES = 500;
+const PENDING_REMOTE_CHANGE_TTL_MS = 30_000;
 
 const commitDepth = (commit: Commit): number => {
   try {
@@ -193,6 +205,18 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // exceeds commitStaggerWindow * rank.
   private _divergedSince: number | undefined;
 
+  // Remote changes whose dependencies haven't arrived yet. ChangeNotice
+  // signals are unordered and lossy, so a change can precede the changes it
+  // depends on; buffering it here instead of feeding it to applyChanges
+  // keeps the live doc free of internally parked changes — the
+  // precondition for the ChangeCollector MissingOps panic (automerge#1327)
+  // that would otherwise poison the doc's wasm handle for the rest of the
+  // session. Drained whenever new changes, sync responses, or commits land.
+  private _pendingRemoteChanges: Array<{
+    bytes: Uint8Array;
+    receivedAt: number;
+  }> = [];
+
   // Agents we've seen leave, keyed by base64 pubkey: the discovery poll
   // ignores their lingering session links until the link delete propagates
   private _recentlyLeft: Map<string, number> = new Map();
@@ -329,6 +353,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                           doc as Automerge.Doc<S>
                         )
                       );
+                      this.drainPendingRemoteChanges();
                       void this.updateSyncStatus();
                     })
                     .catch(() => {
@@ -338,7 +363,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   void this.updateSyncStatus();
                   return;
                 }
-                this._state.set(next);
+                this._state.set(stripParked(next));
+                this.drainPendingRemoteChanges();
               }
             } else {
               const commitState = Automerge.load(
@@ -356,6 +382,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   commitState
                 );
                 this._state.set(next);
+                this.drainPendingRemoteChanges();
               }
             }
           } catch (error) {
@@ -704,74 +731,95 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   change(updateFn: (state: S, ephemeral: E) => void) {
-    this._state.update(state => {
-      let newState = state;
-      this._ephemeral.update(ephemeralState => {
-        let newEphemeralState = ephemeralState;
+    const state = get(this._state);
+    const ephemeralState = get(this._ephemeral);
 
-        newState = Automerge.change(newState, doc => {
-          newEphemeralState = Automerge.change(newEphemeralState, eph => {
-            updateFn(doc as S, eph as E);
-          });
-        });
-
-        const stateChanges = Automerge.getChanges(state, newState);
-        const ephemeralChanges = Automerge.getChanges(
-          ephemeralState,
-          newEphemeralState
-        );
-        this.deltaCount += stateChanges.length;
-        if (stateChanges.length > 0 && this._divergedSince === undefined) {
-          this._divergedSince = Date.now();
-        }
-        if (
-          this.config.commitStrategy.CommitEveryNDeltas &&
-          this.deltaCount > this.config.commitStrategy.CommitEveryNDeltas &&
-          this.amILeader() &&
-          this.viewIsStable() &&
-          Date.now() >= this._backoffUntil &&
-          !this.commitInFlight()
-        ) {
-          this._commitChanges();
-          console.log("Committing changes due to delta count.");
-        } else if (stateChanges.length > 0) {
-          this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
-        }
-
-        const participantsArray = Array.from(get(this._participants).keys()) as AgentPubKey[];
-        const otherParticipants = participantsArray.filter(
-          p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
-        );
-
-        // Set me to active
-        this._participants.update(p => {
-            const info = p.get(this.myPubKey);
-            if (info) {
-                p.set(this.myPubKey, {
-                    ...info,
-                    lastActive: Date.now(),
-                    lastSeen: Date.now(),
-                });
+    // Open the transactions on actor-preserving clones, never on the live
+    // handles: a wasm panic mid-transaction (automerge#1327) leaves the
+    // handle it ran on permanently unusable, and on a clone that only
+    // costs us this one change instead of the whole session. The live doc
+    // doesn't advance between clone and swap, so keeping the actor id is
+    // safe and the history stays linear.
+    let newState: Automerge.Doc<S>;
+    let newEphemeralState: Automerge.Doc<E> | undefined;
+    let stateChanges: Uint8Array[];
+    let ephemeralChanges: Uint8Array[];
+    try {
+      newState = Automerge.change(
+        Automerge.clone(state, Automerge.getActorId(state)),
+        doc => {
+          newEphemeralState = Automerge.change(
+            Automerge.clone(
+              ephemeralState,
+              Automerge.getActorId(ephemeralState)
+            ),
+            eph => {
+              updateFn(doc as S, eph as E);
             }
-            return p;
-        });
+          );
+        }
+      );
+      stateChanges = Automerge.getChanges(state, newState);
+      ephemeralChanges = Automerge.getChanges(
+        ephemeralState,
+        newEphemeralState!
+      );
+    } catch (error) {
+      // The live documents are untouched; rethrow so a throwing grammar
+      // updateFn still surfaces to the caller
+      console.error('syn: change failed; live document unchanged:', error);
+      throw error;
+    }
+    this._state.set(newState);
+    this._ephemeral.set(newEphemeralState!);
 
-        this.workspaceStore.documentStore.synStore.client.sendMessage(
-          otherParticipants,
-          {
-            workspace_hash: this.workspaceStore.workspaceHash,
-            payload: {
-              type: 'ChangeNotice',
-              state_changes: stateChanges.map(c => encode(c) as any),
-              ephemeral_changes: ephemeralChanges.map(c => encode(c) as any),
-            },
-          }
-        );
-        return newEphemeralState;
-      });
+    this.deltaCount += stateChanges.length;
+    if (stateChanges.length > 0 && this._divergedSince === undefined) {
+      this._divergedSince = Date.now();
+    }
+    if (
+      this.config.commitStrategy.CommitEveryNDeltas &&
+      this.deltaCount > this.config.commitStrategy.CommitEveryNDeltas &&
+      this.amILeader() &&
+      this.viewIsStable() &&
+      Date.now() >= this._backoffUntil &&
+      !this.commitInFlight()
+    ) {
+      this._commitChanges();
+      console.log("Committing changes due to delta count.");
+    } else if (stateChanges.length > 0) {
+      this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
+    }
 
-      return newState;
+    const participantsArray = Array.from(get(this._participants).keys()) as AgentPubKey[];
+    const otherParticipants = participantsArray.filter(
+      p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
+    );
+
+    // Set me to active
+    this._participants.update(p => {
+        const info = p.get(this.myPubKey);
+        if (info) {
+            p.set(this.myPubKey, {
+                ...info,
+                lastActive: Date.now(),
+                lastSeen: Date.now(),
+            });
+        }
+        return p;
     });
+
+    this.workspaceStore.documentStore.synStore.client.sendMessage(
+      otherParticipants,
+      {
+        workspace_hash: this.workspaceStore.workspaceHash,
+        payload: {
+          type: 'ChangeNotice',
+          state_changes: stateChanges.map(c => encode(c) as any),
+          ephemeral_changes: ephemeralChanges.map(c => encode(c) as any),
+        },
+      }
+    );
   }
 
   private handleChangeNotice(
@@ -797,24 +845,75 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       this._divergedSince = Date.now();
     }
 
-    this._state.update(state => {
-      const [updatedState] = Automerge.applyChanges(state, stateChanges);
+    this.applyRemoteStateChanges(stateChanges, from);
 
-      return updatedState;
-    });
-
-    this._ephemeral.update(ephemeral => {
-      const [updatedEphemeral] = Automerge.applyChanges(
-        ephemeral,
-        ephemeralChanges
-      );
-
-      return updatedEphemeral;
-    });
+    // Ephemeral state is best-effort by design: apply what's applicable,
+    // drop the rest — but never let applyChanges park changes inside the
+    // live doc or run against the live handle
+    if (ephemeralChanges.length > 0) {
+      try {
+        const result = applyAvailableChanges(
+          get(this._ephemeral),
+          ephemeralChanges
+        );
+        if (result.appliedCount > 0) this._ephemeral.set(result.doc);
+      } catch (error) {
+        console.error('syn: failed to apply ephemeral changes:', error);
+      }
+    }
 
     if (stateChanges.length > 0) {
       this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
     }
+  }
+
+  // Apply incoming remote changes together with any buffered ones, keeping
+  // the invariant that the live doc never internally parks changes with
+  // missing dependencies (automerge#1327): what can't be applied yet is
+  // buffered in _pendingRemoteChanges and retried on the next delivery,
+  // sync response, or commit. On a contained wasm failure the live doc is
+  // untouched and we converge over the sync channel instead.
+  private applyRemoteStateChanges(incoming: Uint8Array[], from?: AgentPubKey) {
+    const now = Date.now();
+    const kept = this._pendingRemoteChanges.filter(
+      p => now - p.receivedAt < PENDING_REMOTE_CHANGE_TTL_MS
+    );
+    if (incoming.length === 0 && kept.length === 0) {
+      this._pendingRemoteChanges = kept;
+      return;
+    }
+    const receivedAt = new Map(kept.map(p => [p.bytes, p.receivedAt] as const));
+    const state = get(this._state);
+    try {
+      const result = applyAvailableChanges(state, [
+        ...kept.map(p => p.bytes),
+        ...incoming,
+      ]);
+      if (result.appliedCount > 0) {
+        this._state.set(result.doc);
+      }
+      this._pendingRemoteChanges = result.deferred
+        .slice(-MAX_PENDING_REMOTE_CHANGES)
+        .map(bytes => ({ bytes, receivedAt: receivedAt.get(bytes) ?? now }));
+      if (result.deferred.length > 0 && from) {
+        // The sender either has the missing dependencies or authored the
+        // gap; an interactive sync closes it without waiting for retries
+        this.requestSync(from);
+      }
+    } catch (error) {
+      console.error(
+        'syn: failed to apply remote changes; live document unchanged, converging via sync:',
+        error
+      );
+      if (from) this.requestSync(from);
+    }
+  }
+
+  // Retry buffered remote changes; called after anything that may have
+  // delivered their missing dependencies (sync responses, adopted commits)
+  private drainPendingRemoteChanges() {
+    if (this._pendingRemoteChanges.length === 0) return;
+    this.applyRemoteStateChanges([]);
   }
 
   requestSync(participant: AgentPubKey) {
@@ -822,12 +921,31 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     if (!participantEntry) return;
     const syncStates = participantEntry.syncStates;
 
-    const [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
-      get(this._state),
-      syncStates.state
-    );
-    const [ephemeralNextSyncState, ephemeralSyncMessage] =
-      Automerge.generateSyncMessage(get(this._ephemeral), syncStates.ephemeral);
+    // generateSyncMessage reconstructs changes by hash (the ChangeCollector
+    // path that can panic, automerge#1327); run it against clones so a
+    // panic costs this sync round, not the live documents
+    let nextSyncState: Automerge.SyncState;
+    let syncMessage: Uint8Array | null;
+    let ephemeralNextSyncState: Automerge.SyncState;
+    let ephemeralSyncMessage: Uint8Array | null;
+    try {
+      const state = get(this._state);
+      const ephemeral = get(this._ephemeral);
+      [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
+        Automerge.clone(state, Automerge.getActorId(state)),
+        syncStates.state
+      );
+      [ephemeralNextSyncState, ephemeralSyncMessage] =
+        Automerge.generateSyncMessage(
+          Automerge.clone(ephemeral, Automerge.getActorId(ephemeral)),
+          syncStates.ephemeral
+        );
+    } catch (error) {
+      // Skip this round; the periodic machinery (discovery polls,
+      // heartbeats, commit flow) retries syncing soon after
+      console.error('syn: generateSyncMessage failed; skipping sync round:', error);
+      return;
+    }
 
     this._participants.update(p => {
       const info = p.get(participant);
@@ -865,47 +983,77 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     syncMessage: Uint8Array | undefined,
     ephemeralSyncMessage: Uint8Array | undefined
   ) {
+    const participantInfo = get(this._participants).get(from);
+    if (!participantInfo) return;
+
+    let stateAdvanced = false;
+    if (syncMessage) {
+      const state = get(this._state);
+      try {
+        // Receive on an actor-preserving clone and swap on success: a wasm
+        // failure mid-receive must cost us the clone, not the live doc
+        const [nextDoc, nextSyncState, _message] =
+          Automerge.receiveSyncMessage(
+            Automerge.clone(state, Automerge.getActorId(state)),
+            participantInfo.syncStates.state,
+            syncMessage
+          );
+        // Defensive: the sync protocol shouldn't deliver changes with
+        // missing dependencies, but a doc that internally parks them is
+        // one MissingOps panic away from being poisoned (automerge#1327);
+        // stripParked is a no-op on a clean doc
+        const next = stripParked(nextDoc);
+        const changes = Automerge.getChanges(state, next);
+        this.deltaCount += changes.length;
+        if (changes.length > 0 && this._divergedSince === undefined) {
+          this._divergedSince = Date.now();
+        }
+        participantInfo.syncStates.state = nextSyncState;
+        this._state.set(next);
+        stateAdvanced = changes.length > 0;
+      } catch (error) {
+        // The half-advanced sync state is untrustworthy after a failure;
+        // restarting the conversation costs one extra negotiation round
+        console.error(
+          'syn: receiveSyncMessage failed; live document unchanged, restarting sync:',
+          error
+        );
+        participantInfo.syncStates.state = Automerge.initSyncState();
+        this._sessionStatus.set({
+          code: 'syncing',
+          lastSave: get(this.sessionStatus).lastSave,
+        });
+      }
+    }
+
+    if (ephemeralSyncMessage) {
+      const ephemeral = get(this._ephemeral);
+      try {
+        const [nextDoc, nextSyncState, _message] =
+          Automerge.receiveSyncMessage(
+            Automerge.clone(ephemeral, Automerge.getActorId(ephemeral)),
+            participantInfo.syncStates.ephemeral,
+            ephemeralSyncMessage
+          );
+        participantInfo.syncStates.ephemeral = nextSyncState;
+        this._ephemeral.set(stripParked(nextDoc));
+      } catch (error) {
+        console.error(
+          'syn: ephemeral receiveSyncMessage failed; restarting sync:',
+          error
+        );
+        participantInfo.syncStates.ephemeral = Automerge.initSyncState();
+      }
+    }
+
     this._participants.update(p => {
-      const participantInfo = p.get(from);
-      if (!participantInfo) return p;
-
-      if (syncMessage) {
-        this._state.update(state => {
-          const [nextDoc, nextSyncState, _message] =
-            Automerge.receiveSyncMessage(
-              state,
-              participantInfo.syncStates.state,
-              syncMessage
-            );
-          const changes = Automerge.getChanges(state, nextDoc);
-          this.deltaCount += changes.length;
-          if (changes.length > 0 && this._divergedSince === undefined) {
-            this._divergedSince = Date.now();
-          }
-
-          participantInfo.syncStates.state = nextSyncState;
-          return nextDoc;
-        });
-      }
-
-      if (ephemeralSyncMessage) {
-        this._ephemeral.update(ephemeral => {
-          const [nextDoc, nextSyncState, _message] =
-            Automerge.receiveSyncMessage(
-              ephemeral,
-              participantInfo.syncStates.ephemeral,
-              ephemeralSyncMessage
-            );
-
-          participantInfo.syncStates.ephemeral = nextSyncState;
-
-          return nextDoc;
-        });
-      }
-
       p.set(from, participantInfo);
       return p;
     });
+
+    // A sync response may have delivered the dependencies buffered
+    // ChangeNotice changes were waiting on
+    if (stateAdvanced) this.drainPendingRemoteChanges();
 
     this.requestSync(from);
   }
@@ -947,21 +1095,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     );
   }
 
-  // Merge `other` into `doc` and rebuild the doc through a save/load
-  // round-trip. The round-trip works around an automerge bug where merged
-  // documents can be left with internal index gaps that later make change
-  // commits or sync-message generation panic inside the wasm module
+  // Merge `other` into `doc` and rebuild the doc through an
+  // actor-preserving save/load round-trip: merged documents can be left
+  // with internal index gaps that later make change commits or
+  // sync-message generation panic inside the wasm module
   // (https://github.com/automerge/automerge/issues/1327).
   private mergeRebuilt(
     doc: Automerge.Doc<S>,
     other: Automerge.Doc<S>
   ): Automerge.Doc<S> {
-    // Preserve the doc's actor id: load() without one assigns a fresh
-    // random actor on every rebuild, accumulating actors in the document
-    // metadata over the life of a session
-    const actor = Automerge.getActorId(doc);
-    const merged = Automerge.merge(doc, other);
-    return Automerge.load(Automerge.save(merged), { actor }) as Automerge.Doc<S>;
+    return rebuildConsistent(Automerge.merge(doc, other));
   }
 
   // Whether two docs hold the same content, even if their change histories

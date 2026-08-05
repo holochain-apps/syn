@@ -211,9 +211,19 @@ test(
       console.log(
         `poisoned-doc diagnostics: max parked changes — alice=${maxParkedAlice} bob=${maxParkedBob}`
       );
-      assert.ok(
-        maxParkedBob > 0,
-        'amplification failed to create the parked-changes precondition on bob'
+      // Before the hardening this storm parked up to 2 changes inside the
+      // live doc every run (the MissingOps panic precondition); the pending
+      // buffer now holds dependency-incomplete changes outside the wasm doc,
+      // so the live documents must stay clean throughout
+      assert.equal(
+        maxParkedBob,
+        0,
+        'live doc parked changes with missing dependencies (panic precondition)'
+      );
+      assert.equal(
+        maxParkedAlice,
+        0,
+        'live doc parked changes with missing dependencies (panic precondition)'
       );
 
       // The real incident manifests exactly here: a poisoned handle throws
