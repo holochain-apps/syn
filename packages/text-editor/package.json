@@ -16,7 +16,7 @@
   },
   "type": "module",
   "dependencies": {
-    "@automerge/automerge": "^3.2.6",
+    "@automerge/automerge": "^3.4.0",
     "@holochain-open-dev/elements": "^0.601.2",
     "@holochain-open-dev/profiles": "^0.601.4",
     "@holochain-open-dev/stores": "^0.601.2",
