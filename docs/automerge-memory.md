@@ -78,27 +78,45 @@ through `SliceStore.change()`. `state` values are not Automerge documents;
 passing them into Automerge APIs fails loudly.
 
 **Teardown order:** `leaveSession` frees the live documents (after a
-bounded wait for any in-flight commit; on timeout the frees are skipped —
-a bounded leak beats a use-after-free), so a still-mounted `docState`
-consumer that re-renders afterwards reads a freed handle and throws.
-Unmount `docState` consumers **before** calling `leaveSession`.
+bounded wait for any in-flight commit; on timeout the release is deferred
+to the commit queue's settlement), so a still-mounted `docState` consumer
+that re-renders afterwards reads a freed handle and throws. Unmount
+`docState` consumers **before** calling `leaveSession`. Additionally,
+`docState` values captured before a commit adoption become invalid once
+the superseded handle's grace window (~30s, `FREE_GRACE_MS`) elapses —
+subscribers that follow updates are unaffected; only long-held stale
+references are.
 
-Until the `latestSnapshot` split below lands, `sessionOrLatestSnapshot`
-is asymmetric by conscious choice: it emits plain snapshots while a
-session is active but real (still-leaked) Docs from `latestSnapshot`
-otherwise — both typed `S`.
+## latestSnapshot (fixed)
 
-## Known remaining leaks (documented, not yet fixed)
+`WorkspaceStore.latestSnapshot` used to hand each subscriber the freshly
+resolved Automerge doc per tip update — the same consumer-owned-clone
+leak shape the state getter had. It now materializes a plain-JS snapshot
+and frees the resolved doc immediately; `latestState`
+(session-or-snapshot) is therefore uniformly plain `S` in both branches.
+`joinSession` resolves its own document directly (the session owns it and
+frees it on leave), and the in-sync checks compare materialized content
+instead of Docs.
 
-1. **`WorkspaceStore.latestSnapshot`**: resolves a fresh doc per tip
-   update and hands it to subscribers — the ownership shape the state
-   getter used to have. It cannot be blindly materialized: `joinSession`
-   consumes its value as the session's initial live document. Needs a
-   split like `state`/`docState`.
-2. **Superseded live handles on commit-adoption swaps** (`_state.set(next)`
-   in the NewCommit paths): the old handle leaks (one doc per adopted
-   commit). Freeing there looks safe — readers appear synchronous — but
-   needs the async-reader audit described above before anyone adds it.
+## Superseded live handles (fixed, grace-window release)
+
+When a commit adoption, tip merge, or parked-fallback rebuild replaces
+the live document with a NEW handle, the superseded handle is released
+via `freeDocLater` — a deferred `freeDoc` after `FREE_GRACE_MS` (30s),
+generously longer than any internal async hold of a live doc (a commit
+holds one across its network calls for seconds). This converts what was
+a leak-per-adopted-commit into a bounded 30s residency, at the cost that
+an async reader holding a doc reference across a >30s stall would throw
+on resume — contained by the surrounding catches, and far outside normal
+operating behavior.
+
+## Known remaining leaks
+
+None, as of the latestSnapshot materialization and the grace-window
+release of superseded live handles (see above). If a new recurring
+allocation is introduced, it must come with an ownership story: freed at
+a clearly-local site, materialized to plain JS, or released through
+`freeDocLater` when it was recently live.
 
 ## Upstream context
 

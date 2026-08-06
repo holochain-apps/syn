@@ -64,13 +64,16 @@ export interface SafeApplyResult<T> {
   /** Free of parked changes. Identical to the input doc when nothing was
    *  applied. When appliedCount > 0, this is the successor proxy of the
    *  input's wasm handle (the apply ran in place — the input proxy is
-   *  stale and the caller must swap to this one). On the rare
-   *  parked-fallback rebuild, this is a NEW handle and the input's handle
-   *  is superseded but not freed (see comment at the fallback). */
+   *  stale and the caller must swap to this one), unless `rebuilt`. */
   doc: Automerge.Doc<T>;
   appliedCount: number;
   /** Change bytes whose dependencies are not present yet; hold and retry */
   deferred: Uint8Array[];
+  /** True when `doc` is a NEW handle (parked-fallback rebuild) and the
+   *  input's handle is superseded — the caller owns releasing it (e.g.
+   *  via freeDocLater when it was the live doc). False when `doc` shares
+   *  the input's handle. */
+  rebuilt: boolean;
 }
 
 /** Apply only the changes whose dependencies the doc already has (directly
@@ -91,7 +94,7 @@ export function applyAvailableChanges<T>(
   changes: Uint8Array[]
 ): SafeApplyResult<T> {
   if (changes.length === 0) {
-    return { doc, appliedCount: 0, deferred: [] };
+    return { doc, appliedCount: 0, deferred: [], rebuilt: false };
   }
 
   // Decode per change so one malformed entry (this is the network boundary:
@@ -152,7 +155,7 @@ export function applyAvailableChanges<T>(
     .map(c => c.bytes);
 
   if (selected.size === 0) {
-    return { doc, appliedCount: 0, deferred };
+    return { doc, appliedCount: 0, deferred, rebuilt: false };
   }
 
   const [applied] = Automerge.applyChanges(
@@ -163,15 +166,14 @@ export function applyAvailableChanges<T>(
   // violation here means the dependency reasoning above is wrong — rebuild
   // from history rather than returning a doc that breaks the
   // no-parked-changes invariant. The input handle (the apply ran in place,
-  // so `applied` shares it) is superseded but deliberately NOT freed: the
-  // caller's input is typically a live store doc whose proxies async
-  // readers may still hold, and a bounded leak on this should-never-happen
-  // path beats a use-after-free.
+  // so `applied` shares it) is superseded; the caller owns releasing it
+  // (`rebuilt: true` → typically freeDocLater, since async readers may
+  // still hold proxies of a live store doc).
   if (hasParkedChanges(applied)) {
     const rebuilt = stripParked(applied);
-    return { doc: rebuilt, appliedCount: selected.size, deferred };
+    return { doc: rebuilt, appliedCount: selected.size, deferred, rebuilt: true };
   }
-  return { doc: applied, appliedCount: selected.size, deferred };
+  return { doc: applied, appliedCount: selected.size, deferred, rebuilt: false };
 }
 
 /** Release a wasm document's memory immediately. The JS GC never reclaims
@@ -185,4 +187,23 @@ export function freeDoc(doc: Automerge.Doc<unknown>): void {
   } catch (e) {
     // double-free or an already-invalid handle: nothing to release
   }
+}
+
+/** Grace window for releasing a handle that was recently the live session
+ *  document: generously longer than any internal async hold of a live doc
+ *  (a commit holds one across its network calls for seconds). */
+export const FREE_GRACE_MS = 30_000;
+
+/** Deferred freeDoc for superseded live handles. Freeing a
+ *  just-superseded live doc immediately risks a use-after-free in an
+ *  async reader that captured it before the swap; waiting out the grace
+ *  window lets every in-flight reader finish first. The timer is unref'd
+ *  where the runtime supports it so pending frees don't hold a process
+ *  open. */
+export function freeDocLater(
+  doc: Automerge.Doc<unknown>,
+  delayMs: number = FREE_GRACE_MS
+): void {
+  const timer = setTimeout(() => freeDoc(doc), delayMs);
+  (timer as any).unref?.();
 }

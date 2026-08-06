@@ -345,15 +345,25 @@ export class WorkspaceStore<S, E> {
   );
 
   /**
-   * Keeps an up to date copy of the state of the tip for this workspace
+   * Keeps an up to date copy of the state of the tip for this workspace,
+   * as a materialized plain-JS snapshot. The resolved Automerge doc is
+   * released immediately after materialization: handing Docs to
+   * subscribers leaked one per tip update, since ownership passed to the
+   * consumer and wasm docs are never GC-reclaimed (docs/automerge-memory.md).
    */
   latestSnapshot: AsyncReadable<S> = pipe(this.tip, commit =>
     commit
-      ? (this.documentStore.resolveCommitState(commit) as Promise<S>)
-      : pipe(
-        this.documentStore.record,
-        document => stateFromDocument(document.entry) as S
-      )
+      ? this.documentStore.resolveCommitState(commit).then(doc => {
+          const snapshot = Automerge.toJS(doc) as S;
+          freeDoc(doc);
+          return snapshot;
+        })
+      : pipe(this.documentStore.record, document => {
+          const doc = stateFromDocument(document.entry);
+          const snapshot = Automerge.toJS(doc) as S;
+          freeDoc(doc);
+          return snapshot;
+        })
   );
 
   /**

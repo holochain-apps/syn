@@ -19,7 +19,7 @@ import { toPromise } from '@holochain-open-dev/stores';
 
 import { SynConfig } from './config.js';
 import { WorkspaceStore } from './workspace-store.js';
-import { stateFromCommit } from './syn-store.js';
+import { stateFromCommit, stateFromDocument } from './syn-store.js';
 import {
   CommitPayload,
   decodeCommitPayload,
@@ -28,6 +28,7 @@ import {
 import {
   applyAvailableChanges,
   freeDoc,
+  freeDocLater,
   hasParkedChanges,
   rebuildConsistent,
   stripParked,
@@ -412,6 +413,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                         )
                       );
                       freeDoc(doc as Automerge.Doc<S>);
+                      freeDocLater(current);
                       this.drainPendingRemoteChanges();
                       void this.updateSyncStatus();
                     })
@@ -428,6 +430,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   freeDoc(next);
                 }
                 this._state.set(adopted);
+                // the old live handle is superseded; release it after the
+                // grace window so in-flight async readers finish first
+                freeDocLater(state);
                 this.drainPendingRemoteChanges();
               }
             } else {
@@ -447,6 +452,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                 );
                 freeDoc(commitState);
                 this._state.set(next);
+                freeDocLater(state);
                 this.drainPendingRemoteChanges();
               }
             }
@@ -672,14 +678,29 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       );
 
     const currentTip = await toPromise(workspaceStore.tip);
-    const currentState: S = await toPromise(workspaceStore.latestSnapshot);
+    // The session's live document must be a real Automerge doc; resolve it
+    // directly (latestSnapshot serves materialized plain snapshots). The
+    // session takes ownership: it is freed in leaveSession.
+    let currentState: Automerge.Doc<S>;
+    if (currentTip) {
+      currentState = (await workspaceStore.documentStore.resolveCommitState(
+        currentTip
+      )) as Automerge.Doc<S>;
+    } else {
+      const documentRecord = await toPromise(
+        workspaceStore.documentStore.record
+      );
+      currentState = stateFromDocument(
+        documentRecord.entry
+      ) as Automerge.Doc<S>;
+    }
     const sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.timestamp).toISOString() : '' };
 
     return new SessionStore(
       workspaceStore,
       onLeave,
       config,
-      currentState as Automerge.Doc<S>,
+      currentState,
       currentTip,
       sessionStatus,
       participants
@@ -747,14 +768,13 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     if (this._tipHeads) {
       inSync = this.inSyncWithTip();
     } else {
-      // Nothing committed yet: in sync only if we match the initial snapshot
+      // Nothing committed yet: in sync only if we match the initial
+      // snapshot. latestSnapshot serves materialized plain values, so
+      // compare content against a materialization of the live doc.
       const latestSnapshot = await toPromise(
         this.workspaceStore.latestSnapshot
       );
-      inSync = this.statesEqual(
-        latestSnapshot as Automerge.Doc<S>,
-        get(this._state)
-      );
+      inSync = isEqual(latestSnapshot, Automerge.toJS(get(this._state)));
     }
     if (inSync) {
       this._divergedSince = undefined;
@@ -930,11 +950,12 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     // live doc or run against the live handle
     if (ephemeralChanges.length > 0) {
       try {
-        const result = applyAvailableChanges(
-          get(this._ephemeral),
-          ephemeralChanges
-        );
-        if (result.appliedCount > 0) this._ephemeral.set(result.doc);
+        const ephemeral = get(this._ephemeral);
+        const result = applyAvailableChanges(ephemeral, ephemeralChanges);
+        if (result.appliedCount > 0) {
+          this._ephemeral.set(result.doc);
+          if (result.rebuilt) freeDocLater(ephemeral);
+        }
       } catch (error) {
         console.error('syn: failed to apply ephemeral changes:', error);
       }
@@ -969,6 +990,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       ]);
       if (result.appliedCount > 0) {
         this._state.set(result.doc);
+        // on the rare parked-fallback rebuild the old live handle is
+        // superseded; release it after the grace window
+        if (result.rebuilt) freeDocLater(state);
       }
       this._pendingRemoteChanges = result.deferred
         .slice(-MAX_PENDING_REMOTE_CHANGES)
@@ -1085,13 +1109,13 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         // one MissingOps panic away from being poisoned (automerge#1327).
         // stripParked is a cheap check on a clean doc. On the rare rebuild
         // the superseded handle — until a moment ago the LIVE doc's handle
-        // (receiveSyncMessage ran in place) — is deliberately NOT freed:
-        // an async reader may still hold a proxy of it, and a bounded leak
-        // on a should-never-happen path beats a use-after-free.
+        // (receiveSyncMessage ran in place) — is released only after the
+        // grace window, since an async reader may still hold a proxy of it.
         next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
         const changes = Automerge.getChanges(state, next);
         participantInfo.syncStates.state = nextSyncState;
         this._state.set(next);
+        if (next !== nextDoc) freeDocLater(nextDoc);
         this.deltaCount += changes.length;
         if (changes.length > 0 && this._divergedSince === undefined) {
           this._divergedSince = Date.now();
@@ -1127,10 +1151,10 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
             ephemeralSyncMessage
           );
         participantInfo.syncStates.ephemeral = nextSyncState;
-        // see the state branch above for why the superseded handle is not
-        // freed on the rare strip path
+        // see the state branch above for the grace-window release
         next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
         this._ephemeral.set(next);
+        if (next !== nextDoc) freeDocLater(nextDoc);
       } catch (error) {
         console.error(
           'syn: ephemeral sync receive failed; restarting sync:',
@@ -1208,13 +1232,6 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     return rebuilt;
   }
 
-  // Whether two docs hold the same content, even if their change histories
-  // (and therefore their serialized forms) differ
-  private statesEqual(a: Automerge.Doc<S>, b: Automerge.Doc<S>): boolean {
-    if (isEqual(Automerge.save(a), Automerge.save(b))) return true;
-    return isEqual(Automerge.toJS(a), Automerge.toJS(b));
-  }
-
   private notifyNewCommit(newCommit: EntryRecord<Commit>) {
     const otherParticipants = (
       Array.from(get(this._participants).keys()) as AgentPubKey[]
@@ -1258,9 +1275,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       const latestSnapshot = await toPromise(
         this.workspaceStore.latestSnapshot
       );
-      if (
-        this.statesEqual(latestSnapshot as Automerge.Doc<S>, get(this._state))
-      ) {
+      if (isEqual(latestSnapshot, Automerge.toJS(get(this._state)))) {
         // Nothing to commit, just return
         this._divergedSince = undefined;
         this._sessionStatus.set({
@@ -1300,6 +1315,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           mergedState
         );
         this._state.set(next);
+        freeDocLater(state);
       }
       freeDoc(mergedState);
 
