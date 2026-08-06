@@ -28,9 +28,12 @@ export class SynMarkdownEditor extends LitElement {
   @property({type: Boolean})
   autotype = false
 
+  // docState (the live automerge doc, read-only), not state: cursor
+  // restoration resolves element ids via Automerge.getObjectId, which
+  // needs a real document, and the materialized state snapshot isn't one
   _state = new StoreSubscriber(
     this,
-    () => this.slice.state,
+    () => this.slice.docState,
     () => [this.slice]
   );
 
@@ -63,7 +66,7 @@ export class SynMarkdownEditor extends LitElement {
     setTimeout(() => {
       this.editor.getInputField().click();
     }, 500);
-    derived([this.slice.state, this.slice.ephemeral], i => i).subscribe(
+    derived([this.slice.docState, this.slice.ephemeral], i => i).subscribe(
       ([state, cursors]) => {
         const stateText = state.text.join('');
         const myAgentSelection =

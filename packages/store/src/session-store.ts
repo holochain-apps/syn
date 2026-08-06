@@ -60,7 +60,16 @@ export interface SliceStore<S, E> {
 
   workspace: WorkspaceStore<S, E>;
 
+  /** Materialized plain-JS snapshot of the state, recomputed per update.
+   *  Leak-free: snapshots are ordinary objects reclaimed by the GC. Not an
+   *  Automerge document — passing it to Automerge APIs fails. */
   state: Readable<S>;
+  /** Zero-copy view of the live Automerge document, for consumers that
+   *  need automerge object identity (e.g. cursor element ids). READ-ONLY:
+   *  never pass it to Automerge.change or any consuming API — mutating it
+   *  advances the live handle out from under the store and wedges the
+   *  session. Use change() for all edits. */
+  docState: Readable<Automerge.Doc<S>>;
   ephemeral: Readable<E>;
 
   sessionStatus: Readable<SessionStatus>;
@@ -77,6 +86,10 @@ export function extractSlice<S1, E1, S2, E2>(
     myPubKey: sliceStore.myPubKey,
     workspace: sliceStore.workspace as any as WorkspaceStore<S2, E2>,
     state: derived(sliceStore.state, sliceState),
+    docState: derived(
+      sliceStore.docState,
+      s => sliceState(s as unknown as S1) as unknown as Automerge.Doc<S2>
+    ),
     ephemeral: derived(sliceStore.ephemeral, sliceEphemeral),
     sessionStatus: sliceStore.sessionStatus,
     change: updateFn =>
@@ -166,8 +179,20 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   _state: Writable<Automerge.Doc<S>>;
+  // Materialized snapshot: Automerge.toJS builds a plain JS object tree
+  // that the normal GC reclaims. The previous Automerge.clone here leaked
+  // one un-freeable wasm doc (~doc size) per update per subscriber and per
+  // transient get() — ownership passed to consumers, so syn could never
+  // free them — killing long UI sessions at the wasm memory cap. See
+  // docs/automerge-memory.md.
   get state(): Readable<S> {
-    return derived(this._state, i => Automerge.clone(i) as S);
+    return derived(this._state, i => Automerge.toJS(i) as S);
+  }
+
+  // Zero-copy live document for consumers needing automerge object
+  // identity (cursor element ids). Read-only by contract: see SliceStore.
+  get docState(): Readable<Automerge.Doc<S>> {
+    return derived(this._state, i => i);
   }
 
   _ephemeral: Writable<Automerge.Doc<E>>;
@@ -218,6 +243,11 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     bytes: Uint8Array;
     receivedAt: number;
   }> = [];
+
+  // Set by leaveSession before the live docs are freed; guards async work
+  // (queued commits, late commit-resolution callbacks) from calling into
+  // freed wasm handles
+  private _left = false;
 
   // Agents we've seen leave, keyed by base64 pubkey: the discovery poll
   // ignores their lingering session links until the link delete propagates
@@ -348,6 +378,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                   this.workspaceStore.documentStore
                     .resolveCommitState(newCommit)
                     .then(doc => {
+                      if (this._left) return;
                       const current = get(this._state);
                       this._state.set(
                         this.mergeRebuilt(
@@ -1190,6 +1221,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   private async commitChangesInternal(meta?: any) {
+    // A commit queued before leaveSession may run after it; the live docs
+    // are freed then, so touching them would be a use-after-free
+    if (this._left) return;
     const tipAtStart = get(this._currentTip);
     if (this._tipHeads && tipAtStart) {
       if (this.inSyncWithTip()) {
@@ -1404,6 +1438,12 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     for (const interval of this.intervals) {
       clearInterval(interval);
     }
+    // No new commits start after this point, and any in-flight commit must
+    // finish before the live docs are freed — a queued commit resuming
+    // after the free would call into a freed wasm handle ("null pointer
+    // passed to rust")
+    this._left = true;
+    await this._commitQueue.catch(() => {});
     // The session is finished: release its live documents (wasm docs are
     // never GC-reclaimed, so join/leave cycles would otherwise accumulate
     // a doc per session). Using this store after leaveSession is invalid.

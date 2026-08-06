@@ -143,7 +143,9 @@ test(
       // differs from the recipient) to keep both agents convergeable.
       async function phantomStorm(rounds: number) {
         for (let i = 0; i < rounds; i++) {
-          const base = get(aliceSessionStore.state);
+          // state is a materialized snapshot (not a Doc); phantom chains
+          // need a real automerge doc, so clone from docState and free it
+          const base = Automerge.clone(get(aliceSessionStore.docState));
           const prevA = Automerge.clone(base);
           const branchA = Automerge.change(prevA, (d: any) => {
             d.title = `phantom-a-${i}`;
