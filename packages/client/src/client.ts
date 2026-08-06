@@ -3,7 +3,6 @@ import {
   EntryHash,
   Record,
   AppClient,
-  AnyDhtHash,
   Link,
   ActionHash,
   encodeHashToBase64,
@@ -42,7 +41,7 @@ export class SynClient extends ZomeClient<SynSignal> {
   }
 
   public async getDocument(
-    documentHash: AnyDhtHash
+    documentHash: EntryHash
   ): Promise<EntryRecord<Document> | undefined> {
     const record: Record | undefined = await this.callZome(
       'get_document',
@@ -54,12 +53,12 @@ export class SynClient extends ZomeClient<SynSignal> {
   }
 
 
-  public async getAuthorsForDocument(documentHash: AnyDhtHash, local?: boolean): Promise<Array<Link>> {
+  public async getAuthorsForDocument(documentHash: EntryHash, local?: boolean): Promise<Array<Link>> {
     return this.callZome('get_authors_for_document', {input: documentHash, local});
   }
 
   public async tagDocument(
-    documentHash: AnyDhtHash,
+    documentHash: EntryHash,
     tag: string
   ): Promise<void> {
     return this.callZome('tag_document', {
@@ -69,7 +68,7 @@ export class SynClient extends ZomeClient<SynSignal> {
   }
 
   public async removeDocumentTag(
-    documentHash: AnyDhtHash,
+    documentHash: EntryHash,
     tag: string
   ): Promise<void> {
     return this.callZome('remove_document_tag', {
@@ -148,7 +147,7 @@ export class SynClient extends ZomeClient<SynSignal> {
   }
 
   public async getCommitsForDocument(
-    documentHash: AnyDhtHash,
+    documentHash: EntryHash,
     local?: boolean,
   ): Promise<Array<Link>> {
     const commits: Array<Link> = await this.callZome('get_commits_for_document', {input: documentHash, local});
@@ -185,7 +184,7 @@ export class SynClient extends ZomeClient<SynSignal> {
   }
 
   public async getWorkspacesForDocument(
-    documentHash: AnyDhtHash,
+    documentHash: EntryHash,
     local?: boolean,
   ): Promise<Array<Link>> {
     return this.callZome('get_workspaces_for_document', {input: documentHash, local});

@@ -25,7 +25,6 @@ import { defaultConfig, LINKS_POLL_INTERVAL_MS, RecursivePartial, SynConfig } fr
 import { DocumentStore } from './document-store.js';
 import { SessionStore } from './session-store.js';
 import { stateFromDocument } from './syn-store.js';
-import { encodeCommitPayload } from './commit-payload.js';
 import { freeDoc } from './automerge-safe.js';
 
 /** Sorts hashes by their base64 encoding, the canonical order shared by all agents */
@@ -272,11 +271,10 @@ export class WorkspaceStore<S, E> {
       authors,
       meta: encode('Merge commit'),
       previous_commit_hashes: sortedHashes,
-      state: encodeCommitPayload({
+      state: {
         kind: 'snapshot',
         data: Automerge.save(mergeState),
-      }),
-      witnesses: [],
+      },
       document_hash: documentHash,
     };
 

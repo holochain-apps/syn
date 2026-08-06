@@ -1,4 +1,4 @@
-import { Commit, SessionMessage } from '@holochain-syn/client';
+import { Commit, CommitState, SessionMessage } from '@holochain-syn/client';
 import {
   EntryRecord,
   HashType,
@@ -13,18 +13,13 @@ import {
 } from '@holochain-open-dev/stores';
 import { decode, encode } from '@msgpack/msgpack';
 import * as Automerge from '@automerge/automerge';
-import { ActionHash, encodeHashToBase64, AgentPubKey, AgentPubKeyMap } from '@holochain/client';
+import { ActionHash, encodeHashToBase64, AgentPubKey, AgentPubKeyMap, Record } from '@holochain/client';
 import isEqual from 'lodash-es/isEqual.js';
 import { toPromise } from '@holochain-open-dev/stores';
 
 import { SynConfig } from './config.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { stateFromCommit, stateFromDocument } from './syn-store.js';
-import {
-  CommitPayload,
-  decodeCommitPayload,
-  encodeCommitPayload,
-} from './commit-payload.js';
 import {
   applyAvailableChanges,
   freeDoc,
@@ -45,14 +40,8 @@ const PENDING_REMOTE_CHANGE_TTL_MS = 30_000;
 // giving up on freeing the session documents (see leaveSession)
 const LEAVE_COMMIT_DRAIN_TIMEOUT_MS = 15_000;
 
-const commitDepth = (commit: Commit): number => {
-  try {
-    const payload = decodeCommitPayload(commit.state);
-    return payload.kind === 'delta' ? payload.depth : 0;
-  } catch (e) {
-    return 0;
-  }
-};
+const commitDepth = (commit: Commit): number =>
+  commit.state.kind === 'delta' ? commit.state.depth : 0;
 
 export type SessionStatus = {
   code: 'ok' | 'error' | 'syncing';
@@ -287,7 +276,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     protected config: SynConfig,
     currentState: Automerge.Doc<S>,
     currentTip: EntryRecord<Commit> | undefined,
-    sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.timestamp).toISOString() : '' },
+    sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.header.timestamp).toISOString() : '' },
     initialParticipants: Array<AgentPubKey>
   ) {
     this._sessionStatus.set(sessionStatus);
@@ -332,7 +321,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           const currentTip = get(this._currentTip);
           const newCommit = new EntryRecord<Commit>(message.payload.new_commit);
           const author =
-            message.payload.new_commit.signed_action.hashed.content.author;
+            message.payload.new_commit.signed_action.hashed.content.header
+              .author;
 
           // An identical entry authored concurrently by another agent (e.g.
           // two leaders racing the same deterministic merge) carries the
@@ -355,16 +345,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           // Apply the commit's payload to our local document. The
           // notification carries the data itself, so we converge even when
           // its author is no longer reachable for an interactive sync.
-          let payload: CommitPayload;
-          try {
-            payload = decodeCommitPayload(newCommit.entry.state);
-          } catch (error) {
-            // Don't adopt a tip whose content we can't decode: our next
-            // commit would silently drop that content from the history.
-            console.error('Failed to decode incoming commit payload:', error);
-            this.requestSync(author);
-            return;
-          }
+          const payload: CommitState = newCommit.entry.state;
 
           let commitHeads: Automerge.Heads;
           try {
@@ -713,7 +694,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         documentRecord.entry
       ) as Automerge.Doc<S>;
     }
-    const sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.timestamp).toISOString() : '' };
+    const sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.header.timestamp).toISOString() : '' };
 
     return new SessionStore(
       workspaceStore,
@@ -781,7 +762,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   private async updateSyncStatus() {
     const tip = get(this._currentTip);
     const lastSave = tip
-      ? new Date(tip.action.timestamp).toISOString()
+      ? new Date(tip.action.header.timestamp).toISOString()
       : get(this.sessionStatus).lastSave;
     let inSync: boolean;
     if (this._tipHeads) {
@@ -1217,7 +1198,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // afterwards.
   async commitChanges(meta?: any) {
     this._commitsInFlight += 1;
-    const run = this._commitQueue.then(() => this.commitChangesInternal(meta));
+    const run = this._commitQueue.then(() =>
+      this.commitChangesWithRetry(meta)
+    );
     // The queue must survive a failed commit; callers see the failure
     // through `run`
     this._commitQueue = run
@@ -1226,6 +1209,33 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         this._commitsInFlight -= 1;
       });
     return run;
+  }
+
+  // Validation fetches a commit's dependencies (parent commits, the
+  // document entry) at authoring time; when a freshly adopted tip hasn't
+  // been gossiped to our conductor yet the commit fails with a retryable
+  // DepMissingFromDht. Recompute the commit from scratch after a short
+  // wait — the tips may have moved while we waited.
+  private async commitChangesWithRetry(meta?: any) {
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.commitChangesInternal(meta);
+      } catch (error) {
+        const message = (error as Error)?.message ?? String(error);
+        const retryable = /may be retried|DepMissingFromDht/.test(message);
+        if (!retryable || attempt >= MAX_RETRIES || this._left) {
+          throw error;
+        }
+        console.warn(
+          `Commit hit a retryable dependency error (attempt ${
+            attempt + 1
+          }/${MAX_RETRIES}), retrying:`,
+          message
+        );
+        await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+      }
+    }
   }
 
   // This is the version of commitChanges that is called by the periodic
@@ -1268,7 +1278,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         workspace_hash: this.workspaceStore.workspaceHash,
         payload: {
           type: 'NewCommit',
-          new_commit: newCommit.record,
+          new_commit: newCommit.record as Record,
         },
       }
     );
@@ -1281,7 +1291,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     this._divergedSince = undefined;
     this._sessionStatus.set({
       code: 'ok',
-      lastSave: new Date(commit.action.timestamp).toISOString(),
+      lastSave: new Date(commit.action.header.timestamp).toISOString(),
     });
   }
 
@@ -1390,7 +1400,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       this._tipDepth + 1 < snapshotEvery &&
       this.headsInHistory(stateAtCommit, this._tipHeads);
 
-    let payload: CommitPayload | undefined;
+    let payload: CommitState | undefined;
     let newDepth = 0;
     if (canDelta) {
       // saveSince can panic (MissingOps) when the live doc carries
@@ -1436,8 +1446,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       ],
       meta,
       previous_commit_hashes,
-      state: encodeCommitPayload(payload),
-      witnesses: [],
+      state: payload,
       document_hash: this.workspaceStore.documentStore.documentHash,
     };
 

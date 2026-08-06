@@ -2,7 +2,6 @@ import { ActionCommittedSignal } from '@holochain-open-dev/utils';
 import {
   ActionHash,
   AgentPubKey,
-  AnyDhtHash,
   EntryHash,
   Record,
 } from '@holochain/client';
@@ -10,17 +9,39 @@ import {
 export interface Document {
   initial_state: Uint8Array;
   meta: Uint8Array | undefined;
+  /** Distinguishes otherwise-identical documents; undefined for
+   * deterministic documents that must converge on one entry hash */
+  nonce: Uint8Array | undefined;
 }
 
-export interface Commit {
-  state: Uint8Array;
+/**
+ * The document state carried by a commit; mirrors the CommitState enum in
+ * the integrity zome.
+ */
+export type CommitState =
+  | {
+      /** A full serialization of the document (`Automerge.save()`) */
+      kind: 'snapshot';
+      data: Uint8Array;
+    }
+  | {
+      /** The changes on top of the parent commit (`Automerge.saveSince()`) */
+      kind: 'delta';
+      data: Uint8Array;
+      /** The document's heads at commit time */
+      heads: string[];
+      /** Number of delta commits since the last snapshot */
+      depth: number;
+    };
 
-  document_hash: AnyDhtHash;
+export interface Commit {
+  state: CommitState;
+
+  document_hash: EntryHash;
 
   previous_commit_hashes: Array<ActionHash>;
 
   authors: Array<AgentPubKey>;
-  witnesses: Array<AgentPubKey>;
 
   meta: Uint8Array | undefined;
 }

@@ -5,11 +5,11 @@
     "start": "vite --clearScreen false --port $UI_PORT"
   },
   "dependencies": {
-    "@holochain-open-dev/profiles": "^0.601.4",
-    "@holochain-open-dev/stores": "^0.601.2",
+    "@holochain-open-dev/profiles": "^0.700.0",
+    "@holochain-open-dev/stores": "^0.700.0",
     "@holochain-syn/core": "file:../packages/core",
     "@holochain-syn/text-editor": "file:../packages/text-editor",
-    "@holochain/client": "^0.20.5",
+    "@holochain/client": "^0.21.0",
     "@lit/context": "^1.0.0",
     "lit": "^3.0.0"
   },

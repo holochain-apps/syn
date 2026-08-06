@@ -38,7 +38,7 @@
     "demo"
   ],
   "devDependencies": {
-    "@holochain/hc-spin": "^0.600.0",
+    "@holochain/hc-spin": "^0.700.0",
     "concurrently": "^6.2.1",
     "eslint": "^7.32.0",
     "eslint-config-prettier": "^8.3.0",

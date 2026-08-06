@@ -64,7 +64,7 @@ pub fn get_workspace(workspace_hash: EntryHash) -> ExternResult<Option<Record>> 
 }
 
 #[hdk_extern]
-pub fn get_workspaces_for_document(document_hash: ZomeFnInput<AnyDhtHash>) -> ExternResult<Vec<Link>> {
+pub fn get_workspaces_for_document(document_hash: ZomeFnInput<EntryHash>) -> ExternResult<Vec<Link>> {
     let strategy = document_hash.get_strategy();
     get_links(
         LinkQuery::try_new(
@@ -81,20 +81,33 @@ pub struct UpdateWorkspaceTipInput {
     previous_commit_hashes: Vec<ActionHash>,
 }
 
-#[derive(Serialize, Deserialize, Debug, SerializedBytes)]
-pub struct PreviousCommitsTag(pub Vec<ActionHash>);
-
 #[hdk_extern]
 pub fn update_workspace_tip(input: UpdateWorkspaceTipInput) -> ExternResult<()> {
     let tag = SerializedBytes::try_from(PreviousCommitsTag(input.previous_commit_hashes.clone()))
         .map_err(|err| wasm_error!(err))?;
 
     create_link_relaxed(
-        input.workspace_hash,
-        input.new_tip_hash,
+        input.workspace_hash.clone(),
+        input.new_tip_hash.clone(),
         LinkTypes::WorkspaceToTip,
         tag.bytes().clone(),
     )?;
+
+    // Retract the tip links this commit supersedes so the link set doesn't
+    // grow without bound; get_workspace_tips keeps pruning by tag for links
+    // whose deletes haven't propagated yet
+    let existing = get_links(
+        LinkQuery::try_new(input.workspace_hash, LinkTypes::WorkspaceToTip)?,
+        GetStrategy::Local,
+    )?;
+    let superseded: HashSet<ActionHash> = input.previous_commit_hashes.into_iter().collect();
+    for link in existing {
+        if let Ok(target) = ActionHash::try_from(link.target.clone()) {
+            if superseded.contains(&target) && target != input.new_tip_hash {
+                delete_link_relaxed(link.create_link_hash)?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -112,15 +125,21 @@ pub fn get_workspace_tips(workspace_hash: ZomeFnInput<EntryHash>) -> ExternResul
     let mut tips: HashMap<ActionHash, Link> = HashMap::new();
     let mut tips_previous = HashSet::new();
     for l in links {
-        tips.insert(
-            ActionHash::try_from(l.target.clone()).map_err(|e| wasm_error!(e))?,
-            l.clone(),
-        );
+        // Validation guarantees action-hash targets; skip anything else so
+        // one odd link can't break tip resolution for everyone
+        let Ok(target) = ActionHash::try_from(l.target.clone()) else {
+            continue;
+        };
+        tips.insert(target, l.clone());
 
-        let previous_commit_hashes = PreviousCommitsTag::try_from(SerializedBytes::from(
+        // Validation guarantees the tag parses for links created under this
+        // integrity zome; skip rather than fail on anything else so one odd
+        // link can't break tip resolution for everyone
+        let Ok(previous_commit_hashes) = PreviousCommitsTag::try_from(SerializedBytes::from(
             UnsafeBytes::from(l.tag.clone().into_inner()),
-        ))
-        .map_err(|err| wasm_error!(err))?;
+        )) else {
+            continue;
+        };
 
         for previous_commit_hash in previous_commit_hashes.0 {
             tips_previous.insert(previous_commit_hash);

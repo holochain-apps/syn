@@ -12,4 +12,4 @@ name = "profiles_coordinator"
 serde = "1"
 hdk = { workspace = true }
 
-hc_zome_profiles_coordinator = {git = "https://github.com/holochain-open-dev/profiles", branch = "main-0.6"}
+hc_zome_profiles_coordinator = {git = "https://github.com/holochain-open-dev/profiles", branch = "main-0.7"}

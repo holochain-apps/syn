@@ -3,11 +3,7 @@ import { assert, test } from 'vitest';
 import { dhtSync, runScenario } from '@holochain-open-dev/tryorama';
 
 import { get, toPromise } from '@holochain-open-dev/stores';
-import {
-  decodeCommitPayload,
-  encodeCommitPayload,
-  SynStore,
-} from '@holochain-syn/store';
+import { SynStore } from '@holochain-syn/store';
 import { Commit, SynClient } from '@holochain-syn/client';
 import { encodeHashToBase64, AppBundleSource } from '@holochain/client';
 import * as Automerge from '@automerge/automerge';
@@ -50,7 +46,7 @@ test('commits after the first are deltas and a later joiner reconstructs the cha
       await aliceSessionStore.commitChanges();
       const tip = get(aliceSessionStore.currentTip);
       assert.ok(tip);
-      payloads.push(decodeCommitPayload(tip!.entry.state));
+      payloads.push(tip!.entry.state);
     }
 
     // The first commit of the document is a full snapshot, the following
@@ -127,11 +123,10 @@ test('concurrent merges of the same tips produce the same commit entry', async (
       authors: [alice.agentPubKey],
       meta: undefined,
       previous_commit_hashes: [],
-      state: encodeCommitPayload({
+      state: {
         kind: 'snapshot',
         data: Automerge.save(doc),
-      }),
-      witnesses: [],
+      },
       document_hash: documentHash,
     });
 

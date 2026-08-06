@@ -35,7 +35,7 @@ pub fn create_commit(commit: Commit) -> ExternResult<Record> {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LinkDocumentToCommitInput {
-    pub document_hash: AnyDhtHash,
+    pub document_hash: EntryHash,
     pub commit_hash: ActionHash,
 }
 
@@ -57,7 +57,7 @@ pub fn get_commit(commit_hash: ActionHash) -> ExternResult<Option<Record>> {
 }
 
 #[hdk_extern]
-pub fn get_commits_for_document(document_hash: ZomeFnInput<AnyDhtHash>) -> ExternResult<Vec<Link>> {
+pub fn get_commits_for_document(document_hash: ZomeFnInput<EntryHash>) -> ExternResult<Vec<Link>> {
     let strategy = document_hash.get_strategy();
     get_links(
         LinkQuery::try_new(

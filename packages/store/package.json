@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/store",
-  "version": "0.603.0",
+  "version": "0.700.0",
   "license": "CAL-1.0",
   "repository": {
     "type": "git",
@@ -29,10 +29,10 @@
   },
   "dependencies": {
     "@automerge/automerge": "^3.4.0",
-    "@holochain-open-dev/stores": "^0.601.2",
-    "@holochain-open-dev/utils": "^0.601.2",
-    "@holochain-syn/client": "^0.603.0",
-    "@holochain/client": "^0.20.5",
+    "@holochain-open-dev/stores": "^0.700.0",
+    "@holochain-open-dev/utils": "^0.700.0",
+    "@holochain-syn/client": "^0.700.0",
+    "@holochain/client": "^0.21.0",
     "@msgpack/msgpack": "^2.7.2",
     "lodash-es": "^4.17.21"
   },

@@ -63,8 +63,8 @@ async function fetchCommits(
     if (!record) continue;
     seen.set(b64, {
       hash: b64.slice(-8),
-      author: encodeHashToBase64(record.action.author).slice(-8),
-      timestamp: record.action.timestamp,
+      author: encodeHashToBase64(record.action.header.author).slice(-8),
+      timestamp: record.action.header.timestamp,
       meta: record.entry.meta ? String(decode(record.entry.meta)) : '',
       prev: record.entry.previous_commit_hashes
         .map(h => encodeHashToBase64(h).slice(-8))
@@ -150,8 +150,7 @@ test(
         authors: [bob.agentPubKey],
         meta: undefined,
         previous_commit_hashes: [c0!.actionHash],
-        state: encode(Automerge.save(bobDoc)),
-        witnesses: [],
+        state: { kind: 'snapshot', data: Automerge.save(bobDoc) },
         document_hash: aliceDocumentStore.documentHash,
       });
       await bobClient.updateWorkspaceTip(

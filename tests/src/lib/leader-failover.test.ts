@@ -379,8 +379,7 @@ test(
         authors: [mallory.agentPubKey],
         meta: encode('corrupt'),
         previous_commit_hashes: [],
-        state: encode(new Uint8Array([1, 2, 3])),
-        witnesses: [],
+        state: { kind: 'snapshot', data: new Uint8Array([1, 2, 3]) },
         document_hash: documentStore.documentHash,
       };
       const corruptCommit = await malloryClient.createCommit(corrupt);

@@ -9,7 +9,7 @@ fn tag_path(tag: String) -> Path {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TagDocumentInput {
-    document_hash: AnyDhtHash,
+    document_hash: EntryHash,
     tag: String,
 }
 
@@ -45,7 +45,7 @@ pub fn get_documents_with_tag(tag: ZomeFnInput<String>) -> ExternResult<Vec<Link
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RemoveDocumentTagInput {
-    document_hash: AnyDhtHash,
+    document_hash: EntryHash,
     tag: String,
 }
 
@@ -59,7 +59,7 @@ pub fn remove_document_tag(input: RemoveDocumentTagInput) -> ExternResult<()> {
     )?;
 
     for link in links {
-        if let Some(target) = link.target.into_any_dht_hash() {
+        if let Some(target) = link.target.into_entry_hash() {
             if target.eq(&input.document_hash) {
                 delete_link(link.create_link_hash, GetOptions::local())?;
             }

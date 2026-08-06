@@ -1,6 +1,5 @@
 import {
   ActionHash,
-  AnyDhtHash,
   EntryHash,
   LazyHoloHashMap,
 } from '@holochain/client';
@@ -25,7 +24,6 @@ import { Commit } from '@holochain-syn/client';
 import { SynStore } from './syn-store.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
-import { decodeCommitPayload } from './commit-payload.js';
 import { freeDoc } from './automerge-safe.js';
 
 // Hard cap on the snapshot-ancestor walk in resolveCommitState: far above
@@ -49,7 +47,7 @@ export class DocumentStore<S, E> {
   private _workspaces: LazyHoloHashMap<EntryHash, WorkspaceStore<S, E>>;
   public documentStoreId = Math.random().toString(36).substring(2);
 
-  constructor(public synStore: SynStore, public documentHash: AnyDhtHash) {
+  constructor(public synStore: SynStore, public documentHash: EntryHash) {
     this._workspaces = new LazyHoloHashMap<EntryHash, WorkspaceStore<S, E>>(
       (workspaceHash: EntryHash) => {
         return new WorkspaceStore<S, E>(this, workspaceHash);
@@ -169,7 +167,7 @@ export class DocumentStore<S, E> {
           `Delta commit chain exceeds ${MAX_DELTA_CHAIN_LENGTH} commits without a snapshot`
         );
       }
-      const payload = decodeCommitPayload(current.entry.state);
+      const payload = current.entry.state;
       if (payload.kind === 'snapshot') {
         let doc = Automerge.load(payload.data);
         for (const delta of deltas.reverse()) {

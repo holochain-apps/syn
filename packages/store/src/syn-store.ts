@@ -9,7 +9,7 @@ import { Commit, Document, SynClient } from '@holochain-syn/client';
 import { decode, encode } from '@msgpack/msgpack';
 import * as Automerge from '@automerge/automerge'
 import { slice } from '@holochain-open-dev/utils';
-import { AnyDhtHash, EntryHash, LazyHoloHashMap } from '@holochain/client';
+import { EntryHash, LazyHoloHashMap } from '@holochain/client';
 
 // Local stand-in for the LazyMap that @holochain-open-dev/utils no longer
 // exports with this signature after the 0.601.x dependency bumps: a plain
@@ -26,7 +26,6 @@ class LazyMap<K, V> {
 
 import { DocumentStore } from './document-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
-import { decodeCommitPayload } from './commit-payload.js';
 import { freeDoc } from './automerge-safe.js';
 
 /** Load the document state carried by a SNAPSHOT commit. Delta commits do
@@ -34,7 +33,7 @@ import { freeDoc } from './automerge-safe.js';
  *  `DocumentStore.resolveCommitState()`, which walks the chain back to the
  *  snapshot ancestor. */
 export const stateFromCommit = (commit: Commit) => {
-  const payload = decodeCommitPayload(commit.state);
+  const payload = commit.state;
   if (payload.kind !== 'snapshot') {
     throw new Error(
       'Cannot load state from a delta commit alone: use DocumentStore.resolveCommitState() to reconstruct it from its snapshot ancestor'
@@ -90,7 +89,7 @@ export class SynStore {
    * Lazy map of all the documents in this network
    */
   documents = new LazyHoloHashMap<EntryHash, DocumentStore<any, any>>(
-    (documentHash: AnyDhtHash) =>
+    (documentHash: EntryHash) =>
       new DocumentStore<any, any>(this, documentHash)
   );
 
@@ -99,12 +98,16 @@ export class SynStore {
     const initialStateBytes = encode(Automerge.save(doc));
     freeDoc(doc);
 
+    // A random nonce gives every created document a distinct entry hash --
+    // the document's canonical identity -- even when the initial content
+    // is identical
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
       initial_state: initialStateBytes,
+      nonce: crypto.getRandomValues(new Uint8Array(32)),
     });
 
-    return this.documents.get(documentRecord.actionHash);
+    return this.documents.get(documentRecord.entryHash);
   }
 
   async createDeterministicDocument<S extends Record<string, unknown>>(initialState: S, meta?: any) {
@@ -121,6 +124,7 @@ export class SynStore {
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
       initial_state: initialStateBytes,
+      nonce: undefined,
     });
 
     return this.documents.get(documentRecord.entryHash);
