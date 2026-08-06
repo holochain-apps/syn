@@ -8,7 +8,9 @@
   const { getSessionStore } = getContext('sessionStore');
 
   const sessionStore = getSessionStore();
-  $: state = sessionStore.state;
+  // docState (read-only live doc view): reading a single field must not pay
+  // the state getter's whole-document materialization per keystroke
+  $: state = sessionStore.docState;
 
   let editingTitle = false
   function saveTitle() {

@@ -56,9 +56,11 @@ update per subscriber (plus one per transient `get(store.state)`) — clones
 syn could never free because ownership passed to the consumer, OOMing a
 bound UI in a few thousand updates. It now serves a **materialized plain-JS
 snapshot** (`Automerge.toJS`): reads are unchanged, snapshots are ordinary
-GC-managed objects, and the leak class is gone. Measured: 8,000 getter
-updates on a 20k-char doc hold a flat RSS, where the clone version was at
-3.2GB by 4,000 and module-dead by ~4,500.
+GC-managed objects, and the leak class is gone. Measured: 4,000 getter
+updates on a 20k-char doc hold a flat 174MB RSS, where the clone version
+was at 3.2GB by 4,000 and module-dead by ~4,500. The getters are
+memoized on the store, so the toJS walk runs once per update no matter
+how many consumers subscribe.
 
 The trade-off is CPU, not memory: `toJS` walks the whole document, and the
 walk is much slower than the wasm-side clone it replaces (measured per
@@ -74,6 +76,17 @@ read-only by contract. **Never pass `docState`'s value to
 handle out from under the store and wedge the session; all edits go
 through `SliceStore.change()`. `state` values are not Automerge documents;
 passing them into Automerge APIs fails loudly.
+
+**Teardown order:** `leaveSession` frees the live documents (after a
+bounded wait for any in-flight commit; on timeout the frees are skipped —
+a bounded leak beats a use-after-free), so a still-mounted `docState`
+consumer that re-renders afterwards reads a freed handle and throws.
+Unmount `docState` consumers **before** calling `leaveSession`.
+
+Until the `latestSnapshot` split below lands, `sessionOrLatestSnapshot`
+is asymmetric by conscious choice: it emits plain snapshots while a
+session is active but real (still-leaked) Docs from `latestSnapshot`
+otherwise — both typed `S`.
 
 ## Known remaining leaks (documented, not yet fixed)
 

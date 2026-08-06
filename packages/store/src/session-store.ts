@@ -40,6 +40,10 @@ import {
 const MAX_PENDING_REMOTE_CHANGES = 500;
 const PENDING_REMOTE_CHANGE_TTL_MS = 30_000;
 
+// How long leaveSession waits for an in-flight commit to finish before
+// giving up on freeing the session documents (see leaveSession)
+const LEAVE_COMMIT_DRAIN_TIMEOUT_MS = 15_000;
+
 const commitDepth = (commit: Commit): number => {
   try {
     const payload = decodeCommitPayload(commit.state);
@@ -185,19 +189,37 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // transient get() — ownership passed to consumers, so syn could never
   // free them — killing long UI sessions at the wasm memory cap. See
   // docs/automerge-memory.md.
+  // Memoized: the toJS walk is O(doc size), so all consumers share one
+  // derived store — one walk per update regardless of subscriber count —
+  // instead of each `.state` access minting its own.
+  private _stateSnapshot: Readable<S> | undefined;
   get state(): Readable<S> {
-    return derived(this._state, i => Automerge.toJS(i) as S);
+    if (!this._stateSnapshot) {
+      this._stateSnapshot = derived(this._state, i => Automerge.toJS(i) as S);
+    }
+    return this._stateSnapshot;
   }
 
   // Zero-copy live document for consumers needing automerge object
   // identity (cursor element ids). Read-only by contract: see SliceStore.
+  private _docState: Readable<Automerge.Doc<S>> | undefined;
   get docState(): Readable<Automerge.Doc<S>> {
-    return derived(this._state, i => i);
+    if (!this._docState) {
+      this._docState = derived(this._state, i => i);
+    }
+    return this._docState;
   }
 
   _ephemeral: Writable<Automerge.Doc<E>>;
+  // Memoized for the same reason as `state`: one materialization per update
+  private _ephemeralSnapshot: Readable<E> | undefined;
   get ephemeral(): Readable<E> {
-    return derived(this._ephemeral, i => JSON.parse(JSON.stringify(i)));
+    if (!this._ephemeralSnapshot) {
+      this._ephemeralSnapshot = derived(this._ephemeral, i =>
+        JSON.parse(JSON.stringify(i))
+      );
+    }
+    return this._ephemeralSnapshot;
   }
 
   _currentTip: Writable<EntryRecord<Commit> | undefined>;
@@ -1441,14 +1463,35 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     // No new commits start after this point, and any in-flight commit must
     // finish before the live docs are freed — a queued commit resuming
     // after the free would call into a freed wasm handle ("null pointer
-    // passed to rust")
+    // passed to rust"). The drain is bounded: a commit stuck on the DHT
+    // (e.g. resolving a commit chain that hasn't gossiped over) must not
+    // hang leaveSession forever, and on timeout the frees are skipped —
+    // a bounded leak beats a use-after-free.
     this._left = true;
-    await this._commitQueue.catch(() => {});
-    // The session is finished: release its live documents (wasm docs are
-    // never GC-reclaimed, so join/leave cycles would otherwise accumulate
-    // a doc per session). Using this store after leaveSession is invalid.
-    freeDoc(get(this._state));
-    freeDoc(get(this._ephemeral));
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      this._commitQueue.catch(() => {}).then(() => true),
+      new Promise<false>(resolve => {
+        drainTimer = setTimeout(
+          () => resolve(false),
+          LEAVE_COMMIT_DRAIN_TIMEOUT_MS
+        );
+      }),
+    ]);
+    clearTimeout(drainTimer);
+    if (drained) {
+      // The session is finished: release its live documents (wasm docs are
+      // never GC-reclaimed, so join/leave cycles would otherwise accumulate
+      // a doc per session). Using this store after leaveSession is invalid.
+      freeDoc(get(this._state));
+      freeDoc(get(this._ephemeral));
+    } else {
+      console.warn(
+        'syn: leaveSession: a commit was still in flight after ' +
+          LEAVE_COMMIT_DRAIN_TIMEOUT_MS +
+          'ms; leaving the session documents unfreed'
+      );
+    }
     this._pendingRemoteChanges = [];
     this.onLeave();
   }
