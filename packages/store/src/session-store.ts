@@ -1489,8 +1489,15 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       console.warn(
         'syn: leaveSession: a commit was still in flight after ' +
           LEAVE_COMMIT_DRAIN_TIMEOUT_MS +
-          'ms; leaving the session documents unfreed'
+          'ms; deferring the session document release until it settles'
       );
+      // _left guarantees no new commits enter the queue, so whenever the
+      // stuck commit finally settles nothing else can touch the docs:
+      // the leak becomes a deferred cleanup instead of a permanent one
+      this._commitQueue.catch(() => {}).then(() => {
+        freeDoc(get(this._state));
+        freeDoc(get(this._ephemeral));
+      });
     }
     this._pendingRemoteChanges = [];
     this.onLeave();
