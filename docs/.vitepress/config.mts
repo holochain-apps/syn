@@ -27,7 +27,7 @@ export default defineConfig({
         text: 'Guides',
         items: [
           {
-            text: 'Getting ready to buld a syn hApp',
+            text: 'Getting ready to build a syn hApp',
             link: '/guides/setup',
           },
           {

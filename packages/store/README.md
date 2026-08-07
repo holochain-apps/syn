@@ -1,50 +1,62 @@
 # @holochain-syn/store
 
-Reactive store that holds the state for the `syn` Holochain zome.
+The syn engine: reactive stores over the `syn` Holochain zome that give you a real-time collaborative document, backed by [Automerge](https://automerge.org).
+
+You mutate a plain JavaScript object; syn synchronizes it with every other agent in the session and periodically commits it to the DHT.
+
+## Installing
+
+```bash
+npm install @holochain-syn/store @holochain-syn/client
+```
+
+The minor version encodes the Holochain version a release targets: `0.700.x` targets Holochain `0.7.0`, `0.603.x` targets Holochain `0.6.3`. The two lines cannot share a network — Holochain 0.7 has no data migration path.
+
+Syn depends on Automerge, which is a WebAssembly module. Bundlers generally need to be told about that; for Vite, add [`vite-plugin-wasm`](https://npmjs.com/package/vite-plugin-wasm) to your dev dependencies and register it in `vite.config.ts`.
 
 ## High-level design
 
-These are the high level concepts that `syn` implements:
-
 - Each network that includes `syn` can manage multiple `document`s.
-- Each `document` is identified by its root commit hash.
-- Each `document` has multiple `workspaces` which can evolve independently of each other, and also fork and merge (eg. "main", "proposal"). 
-- Each `workspace` has a latest "tip" commit, which represents the latest snapshot of the state of the document in that workspace.
-- Finally, each `workspace` has a `session`, which you can join to edit the state of the workspace collaboratively with other agents.
+- Each `document` holds an Automerge document as its state, and is identified by the entry hash of the `Document` entry that created it. Documents can be tagged (eg. "active") so other agents can discover them.
+- Each `document` has multiple `workspaces` which can evolve independently, and also fork and merge (eg. "main", "proposal").
+- Each `workspace` has one or more latest "tip" `commit`s. More than one tip means the workspace diverged and the tips need merging.
+- Finally, each `workspace` has a `session`, which you join to edit the state collaboratively with other agents.
 
-And at the level of code, these concepts translate to these classes:
+At the level of code:
 
-- `SynStore`: to create and fetch the documents in this network.
-- `DocumentStore`: to create and fetch the workspaces for the given document, and also its commits.
-- `WorkspaceStore`: to fetch the latest snaphshot and also the previous commits for the given workspace.
-- `SessionStore`: to edit the state of the given workspace in a real-time collaborative session.
+- `SynStore`: create and fetch the documents in this network.
+- `DocumentStore`: create and fetch the workspaces for a document, and its commits.
+- `WorkspaceStore`: fetch the latest state and previous commits for a workspace, and merge divergent tips.
+- `SessionStore`: edit the state of a workspace in a real-time collaborative session.
 
 ## Initialization
 
 You can initialize a new document like this:
 
 ```ts
-import { AppWebsocket, AppWebsocket } from '@holochain/client';
-import { SynStore, DocumentStore, WorkspaceStore } from '@holochain-syn/store';
+import { AppWebsocket } from '@holochain/client';
+import { SynStore } from '@holochain-syn/store';
 import { SynClient } from '@holochain-syn/client';
 
-const appWs = await AppWebsocket.connect(url);
-const client = await AppWebsocket.connect(appWs, 'YOUR_APP_ID')
+const client = await AppWebsocket.connect();
 
+// 'YOUR_ROLE_NAME' is the role syn's DNA is installed under in your hApp;
+// the zome name defaults to 'syn'
 const synStore = new SynStore(new SynClient(client, 'YOUR_ROLE_NAME', 'YOUR_ZOME_NAME'));
 
 // Create a new document
 const documentStore = await synStore.createDocument(
   // Initial state of the document
   { applicationDefinedField: 'somevalue' },
-  // This is an optional object to be able to store arbitrary information in the commit
-  { meta: 'value'}
+  // This is an optional object to be able to store arbitrary information in the document
+  { meta: 'value' }
 );
+
 // Tag the document as "active" to allow other peers to discover it
-await synStore.client.tagDocument(documentHash, "active")
+await synStore.client.tagDocument(documentStore.documentHash, 'active');
 
 // Create the workspace for the document
-const workspaceStore = new documentStore.createWorkspace(
+const workspaceStore = await documentStore.createWorkspace(
   'main',
   // Commit hash that will act as the initial tip for the workspace
   // Passing undefined means the workspace will be initialized with the document's initial state
@@ -55,29 +67,29 @@ const workspaceStore = new documentStore.createWorkspace(
 At this point, no synchronization is happening yet. This is because you haven't joined the session for the newly created workspace. Let's join the session:
 
 ```ts
-const sessionStore: SessionStore = await sessionStore.joinSession();
+const sessionStore = await workspaceStore.joinSession();
 ```
 
 If you want another peer to discover that document and join the same session, you can do this:
 
 ```ts
-import { AnyDhtHash } from '@holochain/client'
-import { Commit } from '@holochain-syn/client';
-import { EntryRecord, EntryHashMap } from '@holochain-open-dev/utils';
+import { EntryHash } from '@holochain/client';
 import { DocumentStore, WorkspaceStore } from '@holochain-syn/store';
-import { toPromise, joinAsyncMap, pipe } from '@holochain-open-dev/stores';
+import { toPromise } from '@holochain-open-dev/stores';
 
-// Fetch all the active documents
-const documentsHashes: Array<AnyDhtHash> = await synStore.client.getDocumentsWithTag("active");
+// Fetch all the documents tagged "active"
+const documents: ReadonlyMap<EntryHash, DocumentStore<any, any>> =
+  await toPromise(synStore.documentsByTag.get('active'));
 
-// Build the documentStore for the document with the first document
-const documentStore = synStore.documents.get(documentsHashes[0]);
+// Take the first one
+const documentStore = Array.from(documents.values())[0];
 
 // Fetch all workspaces for that document
-const workspaces: ReadonlyMap<EntryHash, WorkspaceStore> = await toPromise(documentStore.allWorkspaces);
+const workspaces: ReadonlyMap<EntryHash, WorkspaceStore<any, any>> =
+  await toPromise(documentStore.allWorkspaces);
 
 // Find the workspace
-const workspaceStore = Array.from(workspaces.entries())[0];
+const workspaceStore = Array.from(workspaces.values())[0];
 
 // Join the session for the workspace
 const sessionStore = await workspaceStore.joinSession();
@@ -90,13 +102,46 @@ Now you are connected to all the peers in that same workspace, and can subscribe
 ```ts
 sessionStore.state.subscribe(state => console.log('New State!', state));
 
-// The input for the function needs to be a function that mutates the given javascript object state 
+// The input for the function needs to be a function that mutates the given javascript object state
 sessionStore.change(state => {
   state.applicationDefinedField = 'Updated content!';
 });
 ```
 
-Alternatively, you can also get information about the current state of the workspace without joining the session:
+`state` gives you a plain snapshot (`Automerge.toJS` output), which is what you want for rendering. If you need Automerge object identity — element ids for cursor positions, say — read the live document through `docState` instead, which is strictly read-only. See [the Automerge memory model](https://holochain-apps.github.io/syn/automerge-memory) for why the distinction matters.
+
+## Ephemeral state
+
+A session carries a second Automerge document alongside the committed state: the **ephemeral** state. It syncs between participants exactly like the main state, but is never written to the DHT and disappears when the session ends. Cursor positions, selections, "who is looking at what" — anything that should be live but not durable — belongs here.
+
+Both documents are typed on the store, `SessionStore<S, E>`, and `change` hands you both:
+
+```ts
+const sessionStore: SessionStore<DocumentState, CursorState> =
+  await workspaceStore.joinSession();
+
+sessionStore.ephemeral.subscribe(cursors => renderCursors(cursors));
+
+sessionStore.change((state, ephemeral) => {
+  ephemeral[myAgentKeyB64] = { position: 42 };
+});
+```
+
+If a component only cares about part of the state, `extractSlice` narrows both documents at once and gives back something with the same interface, so the component never needs to know it isn't holding a whole session:
+
+```ts
+import { extractSlice } from '@holochain-syn/store';
+
+const bodySlice = extractSlice(
+  sessionStore,
+  state => state.body,
+  ephemeral => ephemeral
+);
+```
+
+## Reading a workspace without joining
+
+You can also get information about the current state of the workspace without joining the session:
 
 ```ts
 workspaceStore.tip.subscribe(tip => {
@@ -128,18 +173,32 @@ When you are done with those changes, you need to explicitly leave the session:
 await sessionStore.leaveSession();
 ```
 
-If you don't, all other participants in the session will try to keep synchronizing with you.
+If you don't, all other participants in the session will try to keep synchronizing with you. `leaveSession` also releases the session's Automerge documents, so unmount anything reading `docState` before calling it.
 
 ## Committing
 
-Changes are committed every 10 seconds by default, and also when the last participant for the workspaces leaves the workspace. You can also commit the changes manually:
+Changes are committed every 10 seconds or every 30 deltas by default, whichever comes first, and also when the last participant for the workspace leaves. You can also commit manually:
 
 ```ts
 await sessionStore.commitChanges(
-    // This is an optional object to be able to store arbitrary information in the commit
-  { applicationDefinedField: 'somevalue'} 
+  // This is an optional object to be able to store arbitrary information in the commit
+  { applicationDefinedField: 'somevalue' }
 );
 ```
+
+Most commits carry only the Automerge changes since their parent. Every 20 commits — and for a document's first commit, and for every merge commit — syn writes a full snapshot instead, bounding how far state reconstruction ever has to walk back. All of it is configurable when you join:
+
+```ts
+const sessionStore = await workspaceStore.joinSession({
+  commitStrategy: {
+    CommitEveryNMs: 10 * 1000,
+    CommitEveryNDeltas: 30,
+    SnapshotEveryNCommits: 20,
+  },
+});
+```
+
+Within a session, participants derive a **leadership rank** from the participant list — all of them computing it the same way — and rank 0 does the committing, so the workspace doesn't fill with one redundant entry per participant. Higher ranks take over in staggered windows if changes stay uncommitted, which covers the leader disappearing mid-session. Merge commits are exempt: they are derived entirely from the tips being merged, so two agents merging the same tips produce byte-identical entries that the DHT deduplicates.
 
 ## Migration notes (0.603.x → 0.700.0)
 

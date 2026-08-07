@@ -46,7 +46,7 @@ import '@holochain-open-dev/profiles/dist/elements/profiles-context.js';
 import '@holochain-syn/core/dist/elements/syn-context.js';
 ```
 
-Now define the <profiles-context> and the <syn-context> element and add it to your html wrapping the whole section of your page in which you are going to be placing the elements from @holochain-syn/elements:
+Now define the `<profiles-context>` and the `<syn-context>` element and add them to your html, wrapping the whole section of your page in which you are going to be placing syn elements:
 
 ```html
 <profiles-context id="profiles-context"> 
@@ -60,5 +60,23 @@ Now define the <profiles-context> and the <syn-context> element and add it to yo
 
 Go to [this page](https://holochain-open-dev.github.io/reusable-modules/frontend/frameworks/), select the framework you are using, and follow its example in order to:
 
-- Connect the `ProfilesStore` to the <profiles-context> with id="profiles-context".
-- Connect the `SynStore` to the <syn-context>.
+- Connect the `ProfilesStore` to the `<profiles-context>` with `id="profiles-context"`.
+- Connect the `SynStore` to the `<syn-context>`.
+
+## Elements
+
+Import each element from its `dist/elements/` path to define it:
+
+| Element | What it does |
+| --- | --- |
+| `<syn-context>` | Provides the `SynStore` to everything inside it |
+| `<syn-document-context>` | Provides a `DocumentStore` for a given document hash |
+| `<syn-workspace-context>` | Provides a `WorkspaceStore` for a given workspace hash |
+| `<syn-session-context>` | Provides a joined `SessionStore` |
+| `<commit-history>` | Renders the commit graph for a document |
+| `<session-participants>` | Renders the agents currently in a session |
+| `<workspace-session-participants>` | Same, scoped to a workspace |
+
+This package also re-exports everything from [@holochain-syn/store](https://npmjs.com/package/@holochain-syn/store) and [@holochain-syn/client](https://npmjs.com/package/@holochain-syn/client), so a UI can depend on `@holochain-syn/core` alone.
+
+For a working app built on these pieces, see the [SynText demo](https://github.com/holochain-apps/syn/tree/main/demo).

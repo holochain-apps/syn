@@ -3,10 +3,13 @@
 name: Deploy VitePress site to Pages
 
 on:
-  # Runs on pushes targeting the `main` branch. Change this to `master` if you're
-  # using the `master` branch as the default branch.
+  # Development happens on a per-holochain-version branch (main-0.6, main-0.7,
+  # ...), so the site has to deploy from the current one, not just `main`.
+  # There is a single, unversioned docs site, so only ONE such branch may be
+  # listed here -- otherwise pushes to two lines fight over the published
+  # content. Bump this when a new line becomes current.
   push:
-    branches: [main]
+    branches: [main, main-0.7]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:

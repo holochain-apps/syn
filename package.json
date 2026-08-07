@@ -1,6 +1,7 @@
 {
   "name": "@holochain-syn/dev",
   "private": true,
+  "description": "Development workspace for the syn real-time shared-state engine for Holochain",
   "license": "CAL-1.0",
   "repository": {
     "type": "git",

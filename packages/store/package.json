@@ -1,6 +1,7 @@
 {
   "name": "@holochain-syn/store",
   "version": "0.700.0",
+  "description": "Reactive Automerge-backed stores for syn, the real-time shared-state engine for Holochain",
   "license": "CAL-1.0",
   "repository": {
     "type": "git",
@@ -15,7 +16,8 @@
   "types": "./dist/index.d.ts",
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "exports": {
     ".": {

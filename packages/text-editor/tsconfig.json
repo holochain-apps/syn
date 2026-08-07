@@ -3,6 +3,9 @@
   "compilerOptions": {
     "outDir": "dist",
     "declarationDir": "dist",
-    "declaration": true
+    "declaration": true,
+    "declarationMap": true,
+    // keep the incremental build cache out of dist so it is not published
+    "tsBuildInfoFile": "./.tsbuildinfo"
   }
 }

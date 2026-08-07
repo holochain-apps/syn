@@ -6,12 +6,15 @@ Syn: Etymology. From Ancient Greek συμ- (sum-), variant of συν- (sun-), fr
 
 ## Design
 
-This project makes it easy to build collaborative apps in the distributed peer-to-peer context of Holochain. Syn uses Holochain's infrastructure for data integrity and peer-to-peer networking to store regular "commits" of the shared content's state, while coordinating batches of delta's that comprise those commits between nodes. The approach is generalized for many different use-cases, where the app-developer need only define:
+This project makes it easy to build collaborative apps in the distributed peer-to-peer context of Holochain. The shared state of a document is an [Automerge](https://automerge.org) CRDT: participants exchange changes directly over Holochain's peer-to-peer signals as they type, and periodically commit the state to the DHT, which provides durability and data integrity.
 
-1. A renderer for content state
-2. A patch-grammar for applying deltas to content
-3. A function to apply deltas to the content state
-4. Any user interaction that should generate those deltas in the given grammar
+Because the CRDT does the merging, an app developer doesn't define a delta format or a function to apply one. You need only:
+
+1. A shape for your document's state, as a plain JavaScript object
+2. A renderer for it
+3. User interactions that mutate it inside `sessionStore.change(...)`
+
+Anything that should be live but not durable — cursor positions, selections, presence — goes in the session's separate *ephemeral* state, which syncs the same way but is never committed.
 
 For more details read the [design overview](docs/design.md), read the [article](https://blog.holochain.org/decentralized-next-level-collaboration-apps-with-syn/), and check out the example app, SynText, in the [/demo](demo/) directory.
 
