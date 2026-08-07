@@ -52,11 +52,13 @@ export class SynMarkdownEditor extends LitElement {
     return this.shadowRoot?.getElementById('editor')! as any;
   }
   count = 0
+  _autotypeInterval: ReturnType<typeof setInterval> | undefined;
+  _unsubscribeDoc: (() => void) | undefined;
   firstUpdated() {
     this.editor = this.editorEl.editor;
     this.editor.setOption('lineWrapping', true)
-    setInterval(()=>{
-      if (!this.autotype) return 
+    this._autotypeInterval = setInterval(()=>{
+      if (!this.autotype) return
       this.count+=1
       this.onTextInserted(
         0,
@@ -66,7 +68,10 @@ export class SynMarkdownEditor extends LitElement {
     setTimeout(() => {
       this.editor.getInputField().click();
     }, 500);
-    derived([this.slice.docState, this.slice.ephemeral], i => i).subscribe(
+    // Kept and torn down in disconnectedCallback: docState hands out the
+    // live document, which leaveSession eventually frees — a subscription
+    // outliving the element would read a freed handle on the next update
+    this._unsubscribeDoc = derived([this.slice.docState, this.slice.ephemeral], i => i).subscribe(
       ([state, cursors]) => {
         const stateText = state.text.join('');
         const myAgentSelection =
@@ -183,6 +188,18 @@ export class SynMarkdownEditor extends LitElement {
       class="cursor"
       .agent=${agent}
     ></agent-cursor>`;
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    if (this._autotypeInterval !== undefined) {
+      clearInterval(this._autotypeInterval);
+      this._autotypeInterval = undefined;
+    }
+    if (this._unsubscribeDoc) {
+      this._unsubscribeDoc();
+      this._unsubscribeDoc = undefined;
+    }
   }
 
   render() {

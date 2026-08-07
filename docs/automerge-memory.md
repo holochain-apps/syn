@@ -41,11 +41,12 @@ Corollaries:
   (`saveSince` clones, merge scaffolding, pre-round-trip handles,
   serialized-and-done states, `leaveSession`'s finished live docs).
 - **Never free a handle that was recently the live `_state`/`_ephemeral`
-  handle.** Async readers (a commit in flight, a signal handler) may still
-  hold proxies of it; freeing produces "null pointer passed to rust" at
-  their next touch. On the rare paths where the live handle is superseded
-  by a rebuilt doc (`stripParked` fallbacks), the old handle is
-  deliberately leaked — bounded, and only on should-never-happen paths.
+  handle immediately.** Async readers (a commit in flight, a signal
+  handler) may still hold proxies of it; freeing produces "null pointer
+  passed to rust" at their next touch. When the live handle is superseded
+  by a NEW handle (commit adoptions, tip merges, `stripParked` fallbacks),
+  release the old one with `freeDocLater` — a deferred `freeDoc` after the
+  `FREE_GRACE_MS` window, long after every in-flight reader has finished.
 - `applyAvailableChanges` applies **in place**; its result's ownership
   semantics are documented on `SafeApplyResult`.
 

@@ -9,6 +9,12 @@ import { decode, encode } from '@msgpack/msgpack';
  * Deltas are a versioned envelope holding `Automerge.saveSince()` bytes,
  * the heads of the document at commit time, and the number of delta commits
  * since the last snapshot (so readers know the maximum walk-back length).
+ *
+ * Migration note: the compatibility is one-way. Pre-envelope clients read
+ * every commit as a bare snapshot binary, so the first delta commit written
+ * to a shared DHT is unreadable to them (they fail on the envelope rather
+ * than skipping it). Roll out this client version to a network before
+ * relying on delta commits, or keep old clients off shared documents.
  */
 export type CommitPayload =
   | { kind: 'snapshot'; data: Uint8Array }
@@ -52,6 +58,15 @@ export function decodeCommitPayload(state: Uint8Array): CommitPayload {
     Array.isArray(envelope.heads) &&
     typeof envelope.depth === 'number'
   ) {
+    // Reject envelopes from a newer format version: their `data` may have
+    // different semantics, and feeding them to loadIncremental would apply
+    // unknown bytes. Throwing routes the caller to its existing safe path
+    // (skip the tip, converge through sync and DHT reconstruction).
+    if (envelope.v !== COMMIT_PAYLOAD_VERSION) {
+      throw new Error(
+        `Unsupported commit payload version ${envelope.v} (this client understands v${COMMIT_PAYLOAD_VERSION})`
+      );
+    }
     return {
       kind: 'delta',
       data: envelope.data,

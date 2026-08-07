@@ -440,20 +440,27 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
                 payload.data
               ) as Automerge.Doc<S>;
               commitHeads = Automerge.getHeads(commitState);
-              // Skip the merge when our document already contains the
-              // commit's changes
-              if (!this.headsInHistory(state, commitHeads)) {
-                // Merge a clone outside the store update: Automerge.merge
-                // consumes its target, so a failure mid-merge must not leave
-                // the live document frozen
-                const next = this.mergeRebuilt(
-                  Automerge.clone(state, Automerge.getActorId(state)),
-                  commitState
-                );
+              try {
+                // Skip the merge when our document already contains the
+                // commit's changes
+                if (!this.headsInHistory(state, commitHeads)) {
+                  // Merge a clone outside the store update: Automerge.merge
+                  // consumes its target, so a failure mid-merge must not
+                  // leave the live document frozen
+                  const next = this.mergeRebuilt(
+                    Automerge.clone(state, Automerge.getActorId(state)),
+                    commitState
+                  );
+                  this._state.set(next);
+                  freeDocLater(state);
+                  this.drainPendingRemoteChanges();
+                }
+              } finally {
+                // Released on BOTH paths: the already-in-history skip is
+                // the common case (ChangeNotice delivers the changes before
+                // the commit notice), and leaking here costs one full doc
+                // per snapshot commit per participant
                 freeDoc(commitState);
-                this._state.set(next);
-                freeDocLater(state);
-                this.drainPendingRemoteChanges();
               }
             }
           } catch (error) {
@@ -837,9 +844,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         });
       });
     } catch (error) {
-      // The transaction rolled back and the live documents are untouched;
-      // rethrow so a throwing grammar updateFn still surfaces to the caller
-      console.error('syn: change failed; live document unchanged:', error);
+      // A throwing grammar updateFn rolls back BOTH transactions (the
+      // inner ephemeral one aborts with it) and the live docs are
+      // untouched. But if the inner ephemeral transaction committed and
+      // the OUTER commit then threw, the ephemeral handle has advanced —
+      // the store must be re-pointed at the committed proxy or every
+      // later ephemeral edit fails on an outdated document.
+      if (newEphemeralState !== undefined) {
+        this._ephemeral.set(newEphemeralState);
+      }
+      console.error('syn: change failed; state document unchanged:', error);
       throw error;
     }
     // The transactions committed on the live handles: the stores MUST be

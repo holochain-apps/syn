@@ -90,12 +90,14 @@ export function assertSessionHealthy(
 ) {
   try {
     get(store.state);
-    store.change((state: any, eph: any) =>
-      textEditorGrammar.changes(pubKey, state.body, eph).insert(0, ' ')
-    );
-    store.change((state: any, eph: any) =>
-      textEditorGrammar.changes(pubKey, state.body, eph).delete(0, 1)
-    );
+    // insert+revert in ONE transaction: two separate change() calls leave
+    // a window where a remote change shifts index 0 and the delete would
+    // remove a remote character, breaking later convergence assertions
+    store.change((state: any, eph: any) => {
+      const changes = textEditorGrammar.changes(pubKey, state.body, eph);
+      changes.insert(0, ' ');
+      changes.delete(0, 1);
+    });
   } catch (e) {
     throw new Error(`${label} document is poisoned or unusable: ${e}`);
   }

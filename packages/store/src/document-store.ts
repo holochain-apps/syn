@@ -28,6 +28,11 @@ import { LINKS_POLL_INTERVAL_MS } from './config.js';
 import { decodeCommitPayload } from './commit-payload.js';
 import { freeDoc } from './automerge-safe.js';
 
+// Hard cap on the snapshot-ancestor walk in resolveCommitState: far above
+// any SnapshotEveryNCommits a healthy producer would use, low enough that
+// hostile or corrupt chains fail fast instead of looping
+const MAX_DELTA_CHAIN_LENGTH = 1000;
+
 export function sliceStrings<K extends string, V>(
   map: GetonlyMap<K, V>,
   keys: K[]
@@ -146,7 +151,24 @@ export class DocumentStore<S, E> {
   ): Promise<Automerge.Doc<unknown>> {
     const deltas: Uint8Array[] = [];
     let current = commit;
+    // The snapshot cadence (SnapshotEveryNCommits) bounds well-formed
+    // chains, but it is a producer-side convention and these bytes come
+    // from the DHT: without a cap and a cycle check, a cyclic or absurdly
+    // long parent chain would spin this loop forever (after the first pass
+    // the commits are cached, so iterations never yield). Callers already
+    // treat a throw as "skip this tip and converge through sync".
+    const visited = new Set<string>();
     for (;;) {
+      const currentB64 = current.actionHash.toString();
+      if (visited.has(currentB64)) {
+        throw new Error('Cycle detected in delta commit chain');
+      }
+      visited.add(currentB64);
+      if (visited.size > MAX_DELTA_CHAIN_LENGTH) {
+        throw new Error(
+          `Delta commit chain exceeds ${MAX_DELTA_CHAIN_LENGTH} commits without a snapshot`
+        );
+      }
       const payload = decodeCommitPayload(current.entry.state);
       if (payload.kind === 'snapshot') {
         let doc = Automerge.load(payload.data);

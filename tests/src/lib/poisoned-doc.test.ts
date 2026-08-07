@@ -189,6 +189,8 @@ test(
       // operation that could itself be affected.
       let maxParkedBob = 0;
       let maxParkedAlice = 0;
+      let probeTicks = 0;
+      let probeErrors = 0;
       const probe = setInterval(() => {
         try {
           const bobLive = get((bobSessionStore as any)._state);
@@ -201,9 +203,12 @@ test(
             maxParkedAlice,
             Automerge.getMissingDeps(aliceLive, []).length
           );
+          probeTicks += 1;
         } catch (e) {
-          // a throw here IS the poisoned state; surface it via the health
-          // assertions below rather than from inside the interval
+          // counted and asserted on below: a probe that throws every tick
+          // (poisoned handle, renamed private field) must not let the
+          // parked-changes assertions pass vacuously
+          probeErrors += 1;
         }
       }, 50);
 
@@ -220,7 +225,17 @@ test(
       }
 
       console.log(
-        `poisoned-doc diagnostics: max parked changes — alice=${maxParkedAlice} bob=${maxParkedBob}`
+        `poisoned-doc diagnostics: max parked changes — alice=${maxParkedAlice} bob=${maxParkedBob} (probe ticks=${probeTicks} errors=${probeErrors})`
+      );
+      assert.isAbove(
+        probeTicks,
+        0,
+        'the parked-changes probe never ran successfully'
+      );
+      assert.equal(
+        probeErrors,
+        0,
+        'the parked-changes probe threw — poisoned handle or renamed internals'
       );
       // Before the hardening this storm parked up to 2 changes inside the
       // live doc every run (the MissingOps panic precondition); the pending

@@ -201,6 +201,18 @@ export class WorkspaceStore<S, E> {
     // forever. Merge the resolvable tips and supersede the unresolvable ones
     // as parents, so they stop being tips; live participants that hold their
     // content still converge over the sync channel and re-commit it.
+    //
+    // Known trade-off: resolvability is a LOCAL condition, so two agents
+    // merging concurrently with different gossip coverage can produce
+    // non-identical merge entries for the same parent set — a fork instead
+    // of a DHT-deduped merge. The consequence is bounded: the sibling
+    // merges themselves get merged in the next round, and the skipped
+    // tip's content stays reachable through whichever agent resolved it
+    // (an agent nobody can resolve is unrecoverable regardless). A
+    // deterministic alternative (defer merging until every tip resolves,
+    // with a liveness timeout) trades this bounded extra round for a
+    // wedge risk during partitions; revisit if fork churn shows up in
+    // practice.
     const resolvableRecords: EntryRecord<Commit>[] = [];
     const resolvableStates: Automerge.Doc<S>[] = [];
     for (const record of uniqueRecords) {
