@@ -141,7 +141,16 @@ await sessionStore.commitChanges(
 );
 ```
 
-## Migration notes (0.601.x → this release)
+## Migration notes (0.601.x → 0.603.0)
+
+The minor encodes the holochain version this release is built and tested
+against: **holochain 0.6.3** (hdk 0.6.3 / hdi 0.7.3). There is no 0.602.x
+— we never shipped against holochain 0.6.2.
+
+Dependency ranges are deliberately permissive: `@holochain/client` is
+`^0.20.5`, so anything from 0.20.5 through the 0.20 line (0.20.8 is what
+CI tests against) resolves to a single copy. Nothing in the published
+dependency chain is hard-pinned.
 
 Breaking or behavior-affecting changes for existing callers:
 
@@ -158,8 +167,8 @@ Breaking or behavior-affecting changes for existing callers:
   values into Automerge APIs now fails. Consumers needing automerge
   object identity (e.g. cursor element ids) use the new read-only
   `docState` on `SliceStore`. See `docs/automerge-memory.md` for why.
-- **Delta commits are a one-way format change**: clients older than this
-  release read every commit as a bare snapshot binary and fail on the
+- **Delta commits are a one-way format change**: clients older than
+  0.603.0 read every commit as a bare snapshot binary and fail on the
   first delta commit written to a shared DHT. Upgrade all clients of a
   shared network before relying on delta commits.
 - **`leaveSession` invalidates the store**: it releases the session's
