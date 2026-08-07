@@ -11,14 +11,14 @@
     "url": "https://github.com/holochain-apps/syn/issues"
   },
   "scripts": {
-    "start": "AGENTS=3 BOOTSTRAP_PORT=$(port) SIGNAL_PORT=$(port) npm run network",
+    "start": "AGENTS=3 npm run network",
     "network": "hc s clean && npm run build:happ && UI_PORT=8887 concurrently \"npm run dev:libs\" \"npm run launch:happ\" \"npm start -w demo\"",
     "launch:happ": "concurrently \"hc-spin -n $AGENTS workdir/syn-test.happ --ui-port $UI_PORT \"",
     "dev:libs": "concurrently \"npm run build:watch -w @holochain-syn/client\" \"npm run build:watch -w @holochain-syn/store\" \"npm run build:watch -w @holochain-syn/core\" \"npm run build:watch -w @holochain-syn/text-editor\"",
     "prepare": "npm run build:libs",
     "publish": "npm run build:libs && cd packages/client && npm run build && npm publish --access=public && cd ../store && npm run build && npm publish --access=public && cd ../core && npm run build && npm publish --access=public && cd ../text-editor && npm run build && npm publish --access=public",
     "build:libs": "npm run build -w @holochain-syn/client -w @holochain-syn/store -w @holochain-syn/core -w @holochain-syn/text-editor",
-    "build:ui": "npm run build -w syntext",
+    "build:ui": "npm run build -w demo",
     "test-quick": "npm test -w tests",
     "test": "npm run build:happ && npm run build:libs && npm test -w tests",
     "build:happ": "npm run build:dna && hc app pack workdir",
@@ -34,7 +34,6 @@
     "packages/core",
     "packages/text-editor",
     "tests",
-    "docs",
     "demo"
   ],
   "devDependencies": {
