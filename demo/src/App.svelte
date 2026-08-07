@@ -119,6 +119,7 @@
         'main'
       );
       sessionStore = await workspaceStore.joinSession(config);
+      sessionStatus = sessionStore.sessionStatus
       synStore = store;
     } else {
       documentStore = store.documents.get(documentsHashes[0]);
@@ -158,7 +159,7 @@
         <h1>SynText</h1>
         {$sessionStatus?.code} -
         {$sessionStatus?.lastSave} -
-        {$sessionStatus?.error}
+        {$sessionStatus?.error ?? ''}
         <!-- <div>
           <Title />
         </div> -->
