@@ -16,7 +16,7 @@
     "launch:happ": "concurrently \"hc-spin -n $AGENTS workdir/syn-test.happ --ui-port $UI_PORT \"",
     "dev:libs": "concurrently \"npm run build:watch -w @holochain-syn/client\" \"npm run build:watch -w @holochain-syn/store\" \"npm run build:watch -w @holochain-syn/core\" \"npm run build:watch -w @holochain-syn/text-editor\"",
     "prepare": "npm run build:libs",
-    "publish": "npm run build:libs && cd packages/client && npm run build && npm publish --access=public && cd ../store && npm run build && npm publish --access=public && cd ../core && npm run build && npm publish --access=public && cd ../text-editor && npm run build && npm publish --access=public",
+    "publish": "scripts/publish.sh",
     "build:libs": "npm run build -w @holochain-syn/client -w @holochain-syn/store -w @holochain-syn/core -w @holochain-syn/text-editor",
     "build:ui": "npm run build -w demo",
     "test-quick": "npm test -w tests",
