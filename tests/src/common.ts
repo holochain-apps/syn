@@ -79,6 +79,28 @@ export const sampleGrammar = {
   },
 };
 
+/** Wait until both sessions hold identical text content, throwing `label`
+ *  on timeout. Typing into a not-yet-synced doc anchors the first
+ *  characters at a stale position, so tests use this as a precondition
+ *  before concurrent typing starts. */
+export async function waitForTextConvergence(
+  a: SessionStore<any, any>,
+  b: SessionStore<any, any>,
+  timeoutMs: number,
+  label: string
+) {
+  const converged = await waitUntil(
+    () =>
+      get(b.state).body.text.join('') === get(a.state).body.text.join(''),
+    timeoutMs
+  );
+  if (!converged) {
+    throw new Error(
+      `${label}: sessions did not converge within ${timeoutMs}ms`
+    );
+  }
+}
+
 /** Prove the session's live document is still operable: a poisoned wasm
  *  handle (automerge panic mid-operation) throws "recursive use of an object
  *  detected" on any further read or write. Performs a content-neutral

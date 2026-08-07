@@ -11,6 +11,10 @@ import * as Automerge from '@automerge/automerge'
 import { slice } from '@holochain-open-dev/utils';
 import { AnyDhtHash, EntryHash, LazyHoloHashMap } from '@holochain/client';
 
+// Local stand-in for the LazyMap that @holochain-open-dev/utils no longer
+// exports with this signature after the 0.601.x dependency bumps: a plain
+// keyed memoizing factory (string/tag keys, so LazyHoloHashMap's
+// hash-normalized keying doesn't apply)
 class LazyMap<K, V> {
   private map = new Map<K, V>();
   constructor(private factory: (key: K) => V) {}
@@ -25,6 +29,10 @@ import { LINKS_POLL_INTERVAL_MS } from './config.js';
 import { decodeCommitPayload } from './commit-payload.js';
 import { freeDoc } from './automerge-safe.js';
 
+/** Load the document state carried by a SNAPSHOT commit. Delta commits do
+ *  not carry full state and are rejected here — reconstruct them with
+ *  `DocumentStore.resolveCommitState()`, which walks the chain back to the
+ *  snapshot ancestor. */
 export const stateFromCommit = (commit: Commit) => {
   const payload = decodeCommitPayload(commit.state);
   if (payload.kind !== 'snapshot') {

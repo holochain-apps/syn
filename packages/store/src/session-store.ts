@@ -127,20 +127,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   _participants: Writable<AgentPubKeyMap<SessionParticipant>>;
+  // Memoized like state/docState/ephemeral: leadership checks read this on
+  // every edit and every heartbeat tick, and each access previously built
+  // a fresh derived store. The transform is read-only — the local agent is
+  // seeded in the constructor.
+  private _participantsDerived:
+    | Readable<{ active: AgentPubKey[]; idle: AgentPubKey[]; offline: AgentPubKey[] }>
+    | undefined;
   get participants() {
-    return derived(this._participants, i => {
-      // Make sure I'm in participants list
-      if (!i.has(this.myPubKey)) {
-        i.set(this.myPubKey, {
-            lastSeen: Date.now(),
-            firstSeen: Date.now(),
-            lastActive: Date.now(),
-            syncStates: {
-            state: Automerge.initSyncState(),
-            ephemeral: Automerge.initSyncState(),
-          },
-        });
-      }
+    if (this._participantsDerived) return this._participantsDerived;
+    this._participantsDerived = derived(this._participants, i => {
       // Active is here and active recently
       const isActive = (lastActive: number | undefined) =>
         lastActive && Date.now() - lastActive < this.config.inactiveSessionThreshold;
@@ -181,6 +177,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         offline,
       };
     });
+    return this._participantsDerived;
   }
 
   _state: Writable<Automerge.Doc<S>>;
@@ -656,6 +653,21 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         lastSeen: Date.now(),
         firstSeen: Date.now(),
         lastActive: this.myPubKey === p ? Date.now() : undefined,
+        syncStates: {
+          state: Automerge.initSyncState(),
+          ephemeral: Automerge.initSyncState(),
+        },
+      });
+    }
+    // Seed the local agent here, not in the participants derived transform:
+    // the DHT participant list may not include us yet, and a transform that
+    // mutates the writable's own value desynchronizes the map from what
+    // subscribers were notified with
+    if (!participantsMap.has(this.myPubKey)) {
+      participantsMap.set(this.myPubKey, {
+        lastSeen: Date.now(),
+        firstSeen: Date.now(),
+        lastActive: Date.now(),
         syncStates: {
           state: Automerge.initSyncState(),
           ephemeral: Automerge.initSyncState(),

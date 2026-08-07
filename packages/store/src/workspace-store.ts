@@ -235,20 +235,23 @@ export class WorkspaceStore<S, E> {
       throw new Error('None of the tip states to merge could be loaded');
     }
 
-    let mergeState: Automerge.Doc<S> = resolvableStates[0];
-    for (let i = 1; i < resolvableStates.length; i++) {
-      mergeState = Automerge.merge(mergeState, resolvableStates[i]);
-    }
-    // Rebuild through a save/load round-trip: canonicalizes the document and
-    // works around automerge#1327 (index gaps after merge)
-    const preRoundTrip = mergeState;
-    mergeState = Automerge.load(Automerge.save(mergeState)) as Automerge.Doc<S>;
-    // All merge inputs are locally resolved docs; release them and the
-    // pre-round-trip handle (merge reuses resolvableStates[0]'s handle) —
-    // wasm docs are never GC-reclaimed
-    freeDoc(preRoundTrip);
-    for (let i = 1; i < resolvableStates.length; i++) {
-      freeDoc(resolvableStates[i]);
+    let mergeState: Automerge.Doc<S>;
+    try {
+      let merged: Automerge.Doc<S> = resolvableStates[0];
+      for (let i = 1; i < resolvableStates.length; i++) {
+        merged = Automerge.merge(merged, resolvableStates[i]);
+      }
+      // Rebuild through a save/load round-trip: canonicalizes the document
+      // and works around automerge#1327 (index gaps after merge)
+      mergeState = Automerge.load(Automerge.save(merged)) as Automerge.Doc<S>;
+    } finally {
+      // All merge inputs are locally resolved docs; release them on success
+      // AND on a mid-merge throw (merge reuses resolvableStates[0]'s
+      // handle, so freeing every entry covers the accumulated doc too) —
+      // wasm docs are never GC-reclaimed
+      for (const resolved of resolvableStates) {
+        freeDoc(resolved);
+      }
     }
 
     const documentHash = this.documentStore.documentHash;

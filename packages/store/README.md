@@ -140,3 +140,27 @@ await sessionStore.commitChanges(
   { applicationDefinedField: 'somevalue'} 
 );
 ```
+
+## Migration notes (0.601.x → this release)
+
+Breaking or behavior-affecting changes for existing callers:
+
+- **`SynConfig`**: the misspelled `hearbeatInterval` was renamed to
+  `heartbeatInterval` (a caller still passing the old key silently gets
+  the default — there is no type error through `RecursivePartial`), and
+  `enableHeartbeatInterval` was removed. `CommitStrategy` gained a
+  required `SnapshotEveryNCommits` (default 20), so code constructing a
+  full `CommitStrategy` object must add it; `joinSession(config)` callers
+  passing partial configs are unaffected. New optional tuning fields:
+  `viewSettlingWindow`, `commitStaggerWindow`, `ghostSignalTimeout`.
+- **`state` and `latestSnapshot` serve plain snapshots** (`Automerge.toJS`
+  output), not Automerge documents. Reads are unchanged; passing the
+  values into Automerge APIs now fails. Consumers needing automerge
+  object identity (e.g. cursor element ids) use the new read-only
+  `docState` on `SliceStore`. See `docs/automerge-memory.md` for why.
+- **Delta commits are a one-way format change**: clients older than this
+  release read every commit as a bare snapshot binary and fail on the
+  first delta commit written to a shared DHT. Upgrade all clients of a
+  shared network before relying on delta commits.
+- **`leaveSession` invalidates the store**: it releases the session's
+  wasm documents; unmount `docState` consumers before calling it.
