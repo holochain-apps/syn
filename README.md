@@ -32,7 +32,9 @@ npm install @holochain-syn/store @holochain-syn/client
 
 ### Versioning
 
-The minor version encodes the Holochain version the release targets: `0.603.x` targets Holochain `0.6.3`. There is no `0.602.x` — nothing shipped against `0.6.2`.
+The minor version encodes the Holochain version the release targets: `0.700.x` targets Holochain `0.7.0`, `0.603.x` targets Holochain `0.6.3`.
+
+Holochain 0.7 has no data migration path, so `0.700.x` and `0.603.x` agents cannot share a network and a 0.7 conductor cannot read a 0.6 database. Clear your conductor state (`hc sandbox clean`, or a fresh profile directory) when moving between the two.
 
 ## Development
 

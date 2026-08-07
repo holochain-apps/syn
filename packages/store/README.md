@@ -141,6 +141,42 @@ await sessionStore.commitChanges(
 );
 ```
 
+## Migration notes (0.603.x → 0.700.0)
+
+**Another fully breaking release, and this time the break is wider than the
+DNA.** Holochain 0.7 has no data migration path at all: a 0.7 conductor
+cannot read a 0.6 database, and 0.6 and 0.7 agents form disjoint networks.
+Every user and dev environment needs its conductor state cleared (`hc
+sandbox clean`, or a fresh profile directory) — this is by design upstream,
+not something syn can paper over.
+
+Toolchain: holochain **0.7.0** (hdk 0.7.0 / hdi 0.8.0), `@holochain/client`
+`^0.21.0`, `@holochain-open-dev/*` `^0.700.0`. As on 0.603.0, the ranges are
+permissive and nothing in the published chain is hard-pinned: npm dedupes to
+a single `@holochain/client` copy with no `overrides` block.
+
+API and wire changes for existing callers:
+
+- **`Commit.state` is a tagged `CommitState`**, not an opaque msgpack
+  envelope: `{ kind: 'snapshot', data }` or `{ kind: 'delta', data, heads,
+  depth }`. The separate commit-payload envelope module is gone, and code
+  that decoded it by hand should read `commit.entry.state` directly.
+  `Commit.witnesses` was dropped.
+- **`Document` gained an optional `nonce`** and its canonical identity is
+  the **entry hash**. Ordinary `createDocument` calls get random 32-byte
+  nonces so otherwise-identical documents stay distinct; deterministic
+  documents omit the nonce and still converge on one entry hash.
+- **Validation is stricter**, so malformed input now fails the commit
+  instead of landing: syn entries are immutable (updates and deletes are
+  invalid), delta `depth` must be the parent's plus one, participant links
+  are self-create/self-delete only, and workspace tip tags must parse.
+  Missing dependencies still surface as retryable errors rather than
+  invalidity.
+- **Raw record access moved**: in client 0.21 the common action fields live
+  under `action.header` (`author`, `timestamp`, …) and variant fields under
+  `action.data`. Only code touching records directly is affected — the store
+  and element APIs are unchanged.
+
 ## Migration notes (0.601.x → 0.603.0)
 
 **This is a fully breaking release with a new DNA.** Rebuilding the syn

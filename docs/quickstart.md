@@ -10,7 +10,7 @@ This quickstart assumes you are already familiar with Holochain hApp development
 npm install @holochain-syn/store @holochain-syn/client
 ```
 
-The minor version encodes the Holochain version a release targets: `0.603.x` targets Holochain `0.6.3`.
+The minor version encodes the Holochain version a release targets: `0.700.x` targets Holochain `0.7.0`, `0.603.x` targets Holochain `0.6.3`. The two lines cannot share a network — Holochain 0.7 has no data migration path.
 
 ## Initialization
 
