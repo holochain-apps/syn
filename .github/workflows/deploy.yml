@@ -3,13 +3,12 @@
 name: Deploy VitePress site to Pages
 
 on:
-  # Development happens on a per-holochain-version branch (main-0.6, main-0.7,
-  # ...), so the site has to deploy from the current one, not just `main`.
-  # There is a single, unversioned docs site, so only ONE such branch may be
-  # listed here -- otherwise pushes to two lines fight over the published
-  # content. Bump this when a new line becomes current.
+  # Development happens on `main`; the main-0.x branches are release lines we
+  # backport to. There is a single, unversioned docs site, so it deploys from
+  # `main` only -- listing a release line too would let whichever branch was
+  # pushed last overwrite the published content.
   push:
-    branches: [main, main-0.7]
+    branches: [main]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
