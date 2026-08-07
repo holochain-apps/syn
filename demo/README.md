@@ -1,21 +1,16 @@
 # SynText
 
-A [syn](https://github.com/holochain/syn) sample app for collaborative text editing.
+A [syn](https://github.com/holochain-apps/syn) sample app for collaborative text editing.
 
-This is UI is built using [Svelte](https://svelte.dev) from the [standard template for Svelte apps](https://github.com/sveltejs/template).
+This UI is built with [Svelte](https://svelte.dev) and Vite, and uses the `<syn-text-editor>` element from [`@holochain-syn/text-editor`](../packages/text-editor/).
 
 ## Get started
 
-1. Install the dependencies...
+Run it from the repo root, inside the `nix develop` shell. That builds the hApp and the syn libraries, then launches several agents with `hc-spin`, each with this UI attached:
 
-  ```bash
-  cd ui
-  npm install
-  ```
+```bash
+npm install
+npm run start
+```
 
-2. Run the app
-  ```bash
-  npm run dev
-  ```
-
-3. Navigate to [localhost:5000](http://localhost:5000) in your browser. You should see the UI running.
+The demo has no standalone dev server of its own — `npm run start -w demo` expects `UI_PORT` to be set and a conductor to already be running, which is what the root script arranges.

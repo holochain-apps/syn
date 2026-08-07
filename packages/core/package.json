@@ -1,6 +1,16 @@
 {
   "name": "@holochain-syn/core",
   "version": "0.603.0",
+  "license": "CAL-1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holochain-apps/syn.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/holochain-apps/syn#readme",
+  "bugs": {
+    "url": "https://github.com/holochain-apps/syn/issues"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "type": "module",

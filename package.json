@@ -1,6 +1,15 @@
 {
   "name": "@holochain-syn/dev",
   "private": true,
+  "license": "CAL-1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holochain-apps/syn.git"
+  },
+  "homepage": "https://github.com/holochain-apps/syn#readme",
+  "bugs": {
+    "url": "https://github.com/holochain-apps/syn/issues"
+  },
   "scripts": {
     "start": "AGENTS=3 BOOTSTRAP_PORT=$(port) SIGNAL_PORT=$(port) npm run network",
     "network": "hc s clean && npm run build:happ && UI_PORT=8887 concurrently \"npm run dev:libs\" \"npm run launch:happ\" \"npm start -w demo\"",

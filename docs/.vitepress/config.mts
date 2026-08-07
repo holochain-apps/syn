@@ -51,11 +51,11 @@ export default defineConfig({
     ],
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/vuejs/vitepress' },
+      { icon: 'github', link: 'https://github.com/holochain-apps/syn' },
     ],
     search: {
       provider: 'local',
     },
   },
-  base: '/syn/', // URL is https://holochain.github.io/syn
+  base: '/syn/', // URL is https://holochain-apps.github.io/syn
 });
