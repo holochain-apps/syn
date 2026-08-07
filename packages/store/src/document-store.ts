@@ -9,8 +9,10 @@ import {
   immutableEntryStore,
   liveLinksStore,
   pipe,
+  toPromise,
   uniquify,
 } from '@holochain-open-dev/stores';
+import * as Automerge from '@automerge/automerge';
 import {
   EntryRecord,
   GetonlyMap,
@@ -23,6 +25,13 @@ import { Commit } from '@holochain-syn/client';
 import { SynStore } from './syn-store.js';
 import { WorkspaceStore } from './workspace-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
+import { decodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
+
+// Hard cap on the snapshot-ancestor walk in resolveCommitState: far above
+// any SnapshotEveryNCommits a healthy producer would use, low enough that
+// hostile or corrupt chains fail fast instead of looping
+const MAX_DELTA_CHAIN_LENGTH = 1000;
 
 export function sliceStrings<K extends string, V>(
   map: GetonlyMap<K, V>,
@@ -123,6 +132,71 @@ export class DocumentStore<S, E> {
     ),
     links => uniquify(links.map(l => retype(l.target, HashType.AGENT)))
   );
+
+  /**
+   * Reconstructs the full document state at the given commit.
+   *
+   * Snapshot commits load directly. Delta commits walk back through
+   * `previous_commit_hashes` to the nearest snapshot and replay the deltas
+   * forward. The walk is bounded by the commit strategy's snapshot cadence:
+   * merge commits and every Nth commit are full snapshots.
+   *
+   * Commits are fetched from the locally integrated DHT store; if part of
+   * the chain hasn't gossiped to us yet this throws after the underlying
+   * store's retries, and the caller is expected to converge through the
+   * session sync paths instead.
+   */
+  async resolveCommitState(
+    commit: EntryRecord<Commit>
+  ): Promise<Automerge.Doc<unknown>> {
+    const deltas: Uint8Array[] = [];
+    let current = commit;
+    // The snapshot cadence (SnapshotEveryNCommits) bounds well-formed
+    // chains, but it is a producer-side convention and these bytes come
+    // from the DHT: without a cap and a cycle check, a cyclic or absurdly
+    // long parent chain would spin this loop forever (after the first pass
+    // the commits are cached, so iterations never yield). Callers already
+    // treat a throw as "skip this tip and converge through sync".
+    const visited = new Set<string>();
+    for (;;) {
+      const currentB64 = current.actionHash.toString();
+      if (visited.has(currentB64)) {
+        throw new Error('Cycle detected in delta commit chain');
+      }
+      visited.add(currentB64);
+      if (visited.size > MAX_DELTA_CHAIN_LENGTH) {
+        throw new Error(
+          `Delta commit chain exceeds ${MAX_DELTA_CHAIN_LENGTH} commits without a snapshot`
+        );
+      }
+      const payload = decodeCommitPayload(current.entry.state);
+      if (payload.kind === 'snapshot') {
+        let doc = Automerge.load(payload.data);
+        for (const delta of deltas.reverse()) {
+          doc = Automerge.loadIncremental(doc, delta);
+        }
+        if (deltas.length > 0) {
+          // Rebuild through a save/load round-trip: incremental loads can
+          // leave the doc in an internal state that makes later changes
+          // panic in the wasm module (automerge#1327). Release the
+          // pre-round-trip handle (loadIncremental reuses the initial
+          // load's handle) — wasm docs are never GC-reclaimed.
+          const preRoundTrip = doc;
+          doc = Automerge.load(Automerge.save(doc));
+          freeDoc(preRoundTrip);
+        }
+        return doc;
+      }
+      deltas.push(payload.data);
+      // Delta commits are only created on a linear tip: every hash in
+      // previous_commit_hashes points to the same entry, so any parent works
+      const parentHash = current.entry.previous_commit_hashes[0];
+      if (!parentHash) {
+        throw new Error('Delta commit has no previous commit');
+      }
+      current = await toPromise(this.commits.get(parentHash)!);
+    }
+  }
 
   async createWorkspace(
     workspaceName: string,

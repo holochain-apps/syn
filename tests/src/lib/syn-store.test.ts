@@ -3,7 +3,7 @@ import { assert, test } from 'vitest';
 import { dhtSync, runScenario } from '@holochain-open-dev/tryorama';
 import { get, toPromise } from '@holochain-open-dev/stores';
 
-import { SynStore, stateFromCommit } from '@holochain-syn/store';
+import { SynStore } from '@holochain-syn/store';
 import { SynClient } from '@holochain-syn/client';
 
 import { textEditorGrammar } from '../text-editor-grammar.js';
@@ -174,7 +174,8 @@ test('SynStore, DocumentStore, WorkspaceStore and SessionStore work', async () =
 
     assert.ok(commitHash);
     assert.ok(commit);
-    const state = stateFromCommit(commit!.entry);
+    // The tip may be a delta commit: reconstruct its full state
+    const state = await aliceDocumentStore!.resolveCommitState(commit!);
     assert.deepEqual(state, currentStateAlice);
 
     await bobSessionStore.leaveSession();

@@ -6,16 +6,14 @@ import {
   immutableEntryStore,
   liveLinksStore,
   pipe,
-  sliceAndJoin,
   toPromise,
   uniquify,
   Writable,
   writable,
 } from '@holochain-open-dev/stores';
-import { ActionHash, encodeHashToBase64, EntryHash, HoloHashMap, Link } from '@holochain/client';
+import { ActionHash, AgentPubKey, encodeHashToBase64, EntryHash, HoloHashMap, Link } from '@holochain/client';
 import {
   EntryRecord,
-  GetonlyMap,
   HashType,
   retype,
 } from '@holochain-open-dev/utils';
@@ -26,7 +24,19 @@ import * as Automerge from '@automerge/automerge'
 import { defaultConfig, LINKS_POLL_INTERVAL_MS, RecursivePartial, SynConfig } from './config.js';
 import { DocumentStore } from './document-store.js';
 import { SessionStore } from './session-store.js';
-import { stateFromCommit, stateFromDocument } from './syn-store.js';
+import { stateFromDocument } from './syn-store.js';
+import { encodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
+
+/** Sorts hashes by their base64 encoding, the canonical order shared by all agents */
+export const sortHashes = (hashes: Array<ActionHash>): Array<ActionHash> =>
+  [...hashes].sort((h1, h2) => {
+    const b1 = encodeHashToBase64(h1);
+    const b2 = encodeHashToBase64(h2);
+    if (b1 < b2) return -1;
+    if (b1 > b2) return 1;
+    return 0;
+  });
 
 export class WorkspaceStore<S, E> {
   private _merging = false;
@@ -96,8 +106,42 @@ export class WorkspaceStore<S, E> {
     for (const overwrittenTip of tipsPrevious.keys()) {
       tipsLinks.delete(overwrittenTip);
     }
-    
+
     return Array.from(tipsLinks.keys()) as ActionHash[];
+  }
+
+  /**
+   * Current workspace tips grouped by commit entry hash.
+   *
+   * Tips sharing an entry hash are byte-identical commits authored
+   * concurrently by different agents (e.g. two agents racing the same
+   * deterministic merge): they carry the same state and need no merging.
+   * Groups and their members are sorted by base64 hash, so every agent
+   * computes the same canonical grouping.
+   */
+  async getCurrentTipGroups(): Promise<Array<Array<ActionHash>>> {
+    const tips = await this.getCurrentTips();
+
+    const groups = new HoloHashMap<EntryHash, Array<ActionHash>>();
+    for (const tip of tips) {
+      const record = await toPromise(this.documentStore.commits.get(tip)!);
+      const group = groups.get(record.entryHash);
+      if (group) {
+        group.push(tip);
+      } else {
+        groups.set(record.entryHash, [tip]);
+      }
+    }
+
+    return (Array.from(groups.values()) as Array<Array<ActionHash>>)
+      .map(group => sortHashes(group))
+      .sort((g1, g2) => {
+        const b1 = encodeHashToBase64(g1[0]);
+        const b2 = encodeHashToBase64(g2[0]);
+        if (b1 < b2) return -1;
+        if (b1 > b2) return 1;
+        return 0;
+      });
   }
 
   async merge(commitsHashes: Array<ActionHash>): Promise<EntryRecord<Commit>> {
@@ -133,64 +177,122 @@ export class WorkspaceStore<S, E> {
     }
   }
 
+  // Every field of the merge commit is derived deterministically from the
+  // merged tips, so concurrent agents merging the same tips produce
+  // byte-identical entries that the DHT dedupes by content hash.
   private async _performMerge(commitsHashes: Array<ActionHash>): Promise<EntryRecord<Commit>> {
-    const commits = await toPromise(
-      sliceAndJoin(
-        this.documentStore.commits as GetonlyMap<ActionHash, AsyncReadable<EntryRecord<Commit> | undefined>>,
-        commitsHashes
-      )
-    );
-    // If there are more that one tip, merge them
-    const commitValues: EntryRecord<Commit>[] = Array.from(commits.values()) as EntryRecord<Commit>[];
+    const sortedHashes = sortHashes(commitsHashes);
 
-    // A tip whose state can't be loaded (corrupt bytes, or written by an
-    // incompatible client) can never be merged by anyone, and a single such
-    // commit must not wedge the document forever. Merge the loadable tips
-    // and supersede the unloadable ones as parents, so they stop being
-    // tips; live participants that hold their content still converge over
-    // the sync channel and re-commit it.
-    const loadableStates: Automerge.Doc<S>[] = [];
-    for (const commitValue of commitValues) {
+    const commitRecords: EntryRecord<Commit>[] = [];
+    for (const hash of sortedHashes) {
+      commitRecords.push(await toPromise(this.documentStore.commits.get(hash)!));
+    }
+
+    // Tips with the same entry hash carry the same state: one per group
+    const byEntryHash = new HoloHashMap<EntryHash, EntryRecord<Commit>>();
+    for (const record of commitRecords) {
+      byEntryHash.set(record.entryHash, record);
+    }
+    const uniqueRecords = Array.from(byEntryHash.values()) as EntryRecord<Commit>[];
+
+    // A tip whose state can't be resolved (corrupt bytes, written by an
+    // incompatible client, or a delta chain we don't hold yet) can never be
+    // merged by anyone, and a single such commit must not wedge the document
+    // forever. Merge the resolvable tips and supersede the unresolvable ones
+    // as parents, so they stop being tips; live participants that hold their
+    // content still converge over the sync channel and re-commit it.
+    //
+    // Known trade-off: resolvability is a LOCAL condition, so two agents
+    // merging concurrently with different gossip coverage can produce
+    // non-identical merge entries for the same parent set — a fork instead
+    // of a DHT-deduped merge. The consequence is bounded: the sibling
+    // merges themselves get merged in the next round, and the skipped
+    // tip's content stays reachable through whichever agent resolved it
+    // (an agent nobody can resolve is unrecoverable regardless). A
+    // deterministic alternative (defer merging until every tip resolves,
+    // with a liveness timeout) trades this bounded extra round for a
+    // wedge risk during partitions; revisit if fork churn shows up in
+    // practice.
+    const resolvableRecords: EntryRecord<Commit>[] = [];
+    const resolvableStates: Automerge.Doc<S>[] = [];
+    for (const record of uniqueRecords) {
       try {
-        loadableStates.push(stateFromCommit(commitValue.entry) as Automerge.Doc<S>);
+        resolvableStates.push(
+          (await this.documentStore.resolveCommitState(
+            record
+          )) as Automerge.Doc<S>
+        );
+        resolvableRecords.push(record);
       } catch (error) {
         console.error(
-          'Skipping unloadable tip state during merge:',
-          encodeHashToBase64(commitValue.actionHash),
+          'Skipping unresolvable tip state during merge:',
+          encodeHashToBase64(record.actionHash),
           error
         );
       }
     }
-    if (loadableStates.length === 0) {
+    if (resolvableStates.length === 0) {
       throw new Error('None of the tip states to merge could be loaded');
     }
 
-    let mergeState: Automerge.Doc<S> = loadableStates[0];
-    for (let i = 1; i < loadableStates.length; i++) {
-      mergeState = Automerge.merge(mergeState, loadableStates[i]);
+    let mergeState: Automerge.Doc<S>;
+    try {
+      let merged: Automerge.Doc<S> = resolvableStates[0];
+      for (let i = 1; i < resolvableStates.length; i++) {
+        merged = Automerge.merge(merged, resolvableStates[i]);
+      }
+      // Rebuild through a save/load round-trip: canonicalizes the document
+      // and works around automerge#1327 (index gaps after merge)
+      mergeState = Automerge.load(Automerge.save(merged)) as Automerge.Doc<S>;
+    } finally {
+      // All merge inputs are locally resolved docs; release them on success
+      // AND on a mid-merge throw (merge reuses resolvableStates[0]'s
+      // handle, so freeing every entry covers the accumulated doc too) —
+      // wasm docs are never GC-reclaimed
+      for (const resolved of resolvableStates) {
+        freeDoc(resolved);
+      }
     }
 
     const documentHash = this.documentStore.documentHash;
 
+    // Union of the tips' authors in base64 order, not the merging agent:
+    // who performs the merge must not change the entry
+    const authorsByB64 = new Map<string, AgentPubKey>();
+    for (const record of resolvableRecords) {
+      for (const author of record.entry.authors) {
+        authorsByB64.set(encodeHashToBase64(author), author);
+      }
+    }
+    const authors = Array.from(authorsByB64.keys())
+      .sort()
+      .map(b64 => authorsByB64.get(b64)!);
+
     const commit: Commit = {
-      authors: [this.documentStore.synStore.client.client.myPubKey],
+      authors,
       meta: encode('Merge commit'),
-      previous_commit_hashes: commitsHashes,
-      state: encode(Automerge.save(mergeState)),
+      previous_commit_hashes: sortedHashes,
+      state: encodeCommitPayload({
+        kind: 'snapshot',
+        data: Automerge.save(mergeState),
+      }),
       witnesses: [],
       document_hash: documentHash,
     };
+
+    // the merged state is fully serialized into the commit entry above
+    freeDoc(mergeState);
 
     const newCommit = await this.documentStore.synStore.client.createCommit(
       commit
     );
 
-    console.log(this._workspaceStoreId, this.documentStore.documentStoreId, 'Updating workspace tip to new merge commit:', encodeHashToBase64(newCommit.actionHash), 'from previous tips:', commitsHashes?.map(h => encodeHashToBase64(h)));
+    console.log(this._workspaceStoreId, this.documentStore.documentStoreId, 'Updating workspace tip to new merge commit:', encodeHashToBase64(newCommit.actionHash), 'from previous tips:', sortedHashes.map(h => encodeHashToBase64(h)));
 
     await this.documentStore.synStore.client.updateWorkspaceTip(
       this.workspaceHash,
       newCommit.actionHash,
-      commitsHashes
+      sortedHashes
     );
     return newCommit;
   }
@@ -247,9 +349,10 @@ export class WorkspaceStore<S, E> {
             const tipsHashes = Array.from(tipsLinks.keys()) as ActionHash[];
             if (tipsHashes.length === 0) return undefined;
 
-            // Return first tip without auto-merging
+            // Return the canonical (lowest base64) tip without auto-merging,
+            // so every agent picks the same one.
             // Merging will happen during session commits
-            return tipsHashes[0];
+            return sortHashes(tipsHashes)[0];
           },
           (commit: ActionHash | undefined) =>
             commit ? this.documentStore.commits.get(commit) : undefined
@@ -257,15 +360,25 @@ export class WorkspaceStore<S, E> {
   );
 
   /**
-   * Keeps an up to date copy of the state of the tip for this workspace
+   * Keeps an up to date copy of the state of the tip for this workspace,
+   * as a materialized plain-JS snapshot. The resolved Automerge doc is
+   * released immediately after materialization: handing Docs to
+   * subscribers leaked one per tip update, since ownership passed to the
+   * consumer and wasm docs are never GC-reclaimed (docs/automerge-memory.md).
    */
   latestSnapshot: AsyncReadable<S> = pipe(this.tip, commit =>
     commit
-      ? (stateFromCommit(commit.entry) as S)
-      : pipe(
-        this.documentStore.record,
-        document => stateFromDocument(document.entry) as S
-      )
+      ? this.documentStore.resolveCommitState(commit).then(doc => {
+          const snapshot = Automerge.toJS(doc) as S;
+          freeDoc(doc);
+          return snapshot;
+        })
+      : pipe(this.documentStore.record, document => {
+          const doc = stateFromDocument(document.entry);
+          const snapshot = Automerge.toJS(doc) as S;
+          freeDoc(doc);
+          return snapshot;
+        })
   );
 
   /**

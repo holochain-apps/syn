@@ -13,13 +13,46 @@ import {
 } from '@holochain-open-dev/stores';
 import { decode, encode } from '@msgpack/msgpack';
 import * as Automerge from '@automerge/automerge';
-import { encodeHashToBase64, AgentPubKey, AgentPubKeyMap } from '@holochain/client';
+import { ActionHash, encodeHashToBase64, AgentPubKey, AgentPubKeyMap } from '@holochain/client';
 import isEqual from 'lodash-es/isEqual.js';
 import { toPromise } from '@holochain-open-dev/stores';
 
 import { SynConfig } from './config.js';
 import { WorkspaceStore } from './workspace-store.js';
-import { stateFromCommit } from './syn-store.js';
+import { stateFromCommit, stateFromDocument } from './syn-store.js';
+import {
+  CommitPayload,
+  decodeCommitPayload,
+  encodeCommitPayload,
+} from './commit-payload.js';
+import {
+  applyAvailableChanges,
+  freeDoc,
+  freeDocLater,
+  hasParkedChanges,
+  rebuildConsistent,
+  stripParked,
+} from './automerge-safe.js';
+
+// Bounds for the buffer of remote changes whose dependencies haven't
+// arrived yet (see _pendingRemoteChanges). Expired or overflowing entries
+// are simply dropped: the sync protocol and the commit flow re-deliver
+// anything that matters.
+const MAX_PENDING_REMOTE_CHANGES = 500;
+const PENDING_REMOTE_CHANGE_TTL_MS = 30_000;
+
+// How long leaveSession waits for an in-flight commit to finish before
+// giving up on freeing the session documents (see leaveSession)
+const LEAVE_COMMIT_DRAIN_TIMEOUT_MS = 15_000;
+
+const commitDepth = (commit: Commit): number => {
+  try {
+    const payload = decodeCommitPayload(commit.state);
+    return payload.kind === 'delta' ? payload.depth : 0;
+  } catch (e) {
+    return 0;
+  }
+};
 
 export type SessionStatus = {
   code: 'ok' | 'error' | 'syncing';
@@ -32,7 +65,16 @@ export interface SliceStore<S, E> {
 
   workspace: WorkspaceStore<S, E>;
 
+  /** Materialized plain-JS snapshot of the state, recomputed per update.
+   *  Leak-free: snapshots are ordinary objects reclaimed by the GC. Not an
+   *  Automerge document — passing it to Automerge APIs fails. */
   state: Readable<S>;
+  /** Zero-copy view of the live Automerge document, for consumers that
+   *  need automerge object identity (e.g. cursor element ids). READ-ONLY:
+   *  never pass it to Automerge.change or any consuming API — mutating it
+   *  advances the live handle out from under the store and wedges the
+   *  session. Use change() for all edits. */
+  docState: Readable<Automerge.Doc<S>>;
   ephemeral: Readable<E>;
 
   sessionStatus: Readable<SessionStatus>;
@@ -49,6 +91,10 @@ export function extractSlice<S1, E1, S2, E2>(
     myPubKey: sliceStore.myPubKey,
     workspace: sliceStore.workspace as any as WorkspaceStore<S2, E2>,
     state: derived(sliceStore.state, sliceState),
+    docState: derived(
+      sliceStore.docState,
+      s => sliceState(s as unknown as S1) as unknown as Automerge.Doc<S2>
+    ),
     ephemeral: derived(sliceStore.ephemeral, sliceEphemeral),
     sessionStatus: sliceStore.sessionStatus,
     change: updateFn =>
@@ -81,20 +127,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   _participants: Writable<AgentPubKeyMap<SessionParticipant>>;
+  // Memoized like state/docState/ephemeral: leadership checks read this on
+  // every edit and every heartbeat tick, and each access previously built
+  // a fresh derived store. The transform is read-only — the local agent is
+  // seeded in the constructor.
+  private _participantsDerived:
+    | Readable<{ active: AgentPubKey[]; idle: AgentPubKey[]; offline: AgentPubKey[] }>
+    | undefined;
   get participants() {
-    return derived(this._participants, i => {
-      // Make sure I'm in participants list
-      if (!i.has(this.myPubKey)) {
-        i.set(this.myPubKey, {
-            lastSeen: Date.now(),
-            firstSeen: Date.now(),
-            lastActive: Date.now(),
-            syncStates: {
-            state: Automerge.initSyncState(),
-            ephemeral: Automerge.initSyncState(),
-          },
-        });
-      }
+    if (this._participantsDerived) return this._participantsDerived;
+    this._participantsDerived = derived(this._participants, i => {
       // Active is here and active recently
       const isActive = (lastActive: number | undefined) =>
         lastActive && Date.now() - lastActive < this.config.inactiveSessionThreshold;
@@ -135,16 +177,47 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         offline,
       };
     });
+    return this._participantsDerived;
   }
 
   _state: Writable<Automerge.Doc<S>>;
+  // Materialized snapshot: Automerge.toJS builds a plain JS object tree
+  // that the normal GC reclaims. The previous Automerge.clone here leaked
+  // one un-freeable wasm doc (~doc size) per update per subscriber and per
+  // transient get() — ownership passed to consumers, so syn could never
+  // free them — killing long UI sessions at the wasm memory cap. See
+  // docs/automerge-memory.md.
+  // Memoized: the toJS walk is O(doc size), so all consumers share one
+  // derived store — one walk per update regardless of subscriber count —
+  // instead of each `.state` access minting its own.
+  private _stateSnapshot: Readable<S> | undefined;
   get state(): Readable<S> {
-    return derived(this._state, i => Automerge.clone(i) as S);
+    if (!this._stateSnapshot) {
+      this._stateSnapshot = derived(this._state, i => Automerge.toJS(i) as S);
+    }
+    return this._stateSnapshot;
+  }
+
+  // Zero-copy live document for consumers needing automerge object
+  // identity (cursor element ids). Read-only by contract: see SliceStore.
+  private _docState: Readable<Automerge.Doc<S>> | undefined;
+  get docState(): Readable<Automerge.Doc<S>> {
+    if (!this._docState) {
+      this._docState = derived(this._state, i => i);
+    }
+    return this._docState;
   }
 
   _ephemeral: Writable<Automerge.Doc<E>>;
+  // Memoized for the same reason as `state`: one materialization per update
+  private _ephemeralSnapshot: Readable<E> | undefined;
   get ephemeral(): Readable<E> {
-    return derived(this._ephemeral, i => JSON.parse(JSON.stringify(i)));
+    if (!this._ephemeralSnapshot) {
+      this._ephemeralSnapshot = derived(this._ephemeral, i =>
+        JSON.parse(JSON.stringify(i))
+      );
+    }
+    return this._ephemeralSnapshot;
   }
 
   _currentTip: Writable<EntryRecord<Commit> | undefined>;
@@ -161,9 +234,11 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   private intervals: any[] = [];
   private deltaCount = 0;
 
-  // Heads of the state recorded in the current tip commit: the basis for
-  // the cheap in-sync check
+  // Heads and delta-depth of the state recorded in the current tip commit.
+  // The heads are the basis for delta commits (saveSince) and for the cheap
+  // in-sync check; the depth bounds the delta chain before a snapshot is due.
   private _tipHeads: Automerge.Heads | undefined;
+  private _tipDepth = 0;
 
   // Leadership rank is only acted on when the participant view has been
   // stable for the settling window and we're outside the collision backoff
@@ -176,6 +251,23 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   // undefined while in sync. Non-leaders take over committing when this age
   // exceeds commitStaggerWindow * rank.
   private _divergedSince: number | undefined;
+
+  // Remote changes whose dependencies haven't arrived yet. ChangeNotice
+  // signals are unordered and lossy, so a change can precede the changes it
+  // depends on; buffering it here instead of feeding it to applyChanges
+  // keeps the live doc free of internally parked changes — the
+  // precondition for the ChangeCollector MissingOps panic (automerge#1327)
+  // that would otherwise poison the doc's wasm handle for the rest of the
+  // session. Drained whenever new changes, sync responses, or commits land.
+  private _pendingRemoteChanges: Array<{
+    bytes: Uint8Array;
+    receivedAt: number;
+  }> = [];
+
+  // Set by leaveSession before the live docs are freed; guards async work
+  // (queued commits, late commit-resolution callbacks) from calling into
+  // freed wasm handles
+  private _left = false;
 
   // Agents we've seen leave, keyed by base64 pubkey: the discovery poll
   // ignores their lingering session links until the link delete propagates
@@ -242,28 +334,131 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           const author =
             message.payload.new_commit.signed_action.hashed.content.author;
 
-          // Merge the commit's state into our local document. The commit
-          // carries the full document, so we converge even when its author
-          // is no longer reachable for an interactive sync.
+          // An identical entry authored concurrently by another agent (e.g.
+          // two leaders racing the same deterministic merge) carries the
+          // same content: no merging or syncing needed. Keep the canonical
+          // (lowest base64) action as our tip so all agents converge on it.
+          if (
+            currentTip &&
+            encodeHashToBase64(newCommit.entryHash) ===
+              encodeHashToBase64(currentTip.entryHash)
+          ) {
+            if (
+              encodeHashToBase64(newCommit.actionHash) <
+              encodeHashToBase64(currentTip.actionHash)
+            ) {
+              this._currentTip.set(newCommit);
+            }
+            return;
+          }
+
+          // Apply the commit's payload to our local document. The
+          // notification carries the data itself, so we converge even when
+          // its author is no longer reachable for an interactive sync.
+          let payload: CommitPayload;
+          try {
+            payload = decodeCommitPayload(newCommit.entry.state);
+          } catch (error) {
+            // Don't adopt a tip whose content we can't decode: our next
+            // commit would silently drop that content from the history.
+            console.error('Failed to decode incoming commit payload:', error);
+            this.requestSync(author);
+            return;
+          }
+
           let commitHeads: Automerge.Heads;
           try {
-            const commitState = stateFromCommit(
-              newCommit.entry
-            ) as Automerge.Doc<S>;
-            commitHeads = Automerge.getHeads(commitState);
             const state = get(this._state);
-            // Skip the merge when our document already contains the
-            // commit's changes (the common case: they arrived as deltas
-            // through ChangeNotice signals before the commit did)
-            if (!this.headsInHistory(state, commitHeads)) {
-              // Merge a clone outside the store update: Automerge.merge
-              // consumes its target, so a failure mid-merge must not leave
-              // the live document frozen
-              const next = this.mergeRebuilt(
-                Automerge.clone(state, Automerge.getActorId(state)),
-                commitState
-              );
-              this._state.set(next);
+            if (payload.kind === 'delta') {
+              commitHeads = payload.heads;
+              // Skip application when our document already contains the
+              // delta's changes (the common case: they arrived through
+              // ChangeNotice signals before the commit did)
+              if (!this.headsInHistory(state, commitHeads)) {
+                // Apply on a clone outside the store update so a mid-apply
+                // throw can't freeze the live document, then rebuild
+                // through save/load (automerge#1327, see mergeRebuilt)
+                const actor = Automerge.getActorId(state);
+                const applied = Automerge.loadIncremental(
+                  Automerge.clone(state, actor),
+                  payload.data
+                );
+                const next = Automerge.load(Automerge.save(applied), {
+                  actor,
+                }) as Automerge.Doc<S>;
+                // the clone+loadIncremental intermediate is superseded by
+                // the round-tripped doc; wasm docs are never GC-reclaimed
+                freeDoc(applied);
+                if (!this.headsInHistory(next, commitHeads)) {
+                  // The delta references history we don't have. Don't adopt
+                  // the tip; converge through an interactive sync with the
+                  // author and through reconstruction from the locally
+                  // integrated DHT store as gossip delivers the chain.
+                  this.requestSync(author);
+                  this.workspaceStore.documentStore
+                    .resolveCommitState(newCommit)
+                    .then(doc => {
+                      if (this._left) return;
+                      const current = get(this._state);
+                      this._state.set(
+                        this.mergeRebuilt(
+                          Automerge.clone(
+                            current,
+                            Automerge.getActorId(current)
+                          ),
+                          doc as Automerge.Doc<S>
+                        )
+                      );
+                      freeDoc(doc as Automerge.Doc<S>);
+                      freeDocLater(current);
+                      this.drainPendingRemoteChanges();
+                      void this.updateSyncStatus();
+                    })
+                    .catch(() => {
+                      // Part of the chain hasn't gossiped to us yet; the
+                      // sync path converges us in the meantime
+                    });
+                  void this.updateSyncStatus();
+                  return;
+                }
+                let adopted = next;
+                if (hasParkedChanges(next)) {
+                  adopted = stripParked(next);
+                  freeDoc(next);
+                }
+                this._state.set(adopted);
+                // the old live handle is superseded; release it after the
+                // grace window so in-flight async readers finish first
+                freeDocLater(state);
+                this.drainPendingRemoteChanges();
+              }
+            } else {
+              const commitState = Automerge.load(
+                payload.data
+              ) as Automerge.Doc<S>;
+              commitHeads = Automerge.getHeads(commitState);
+              try {
+                // Skip the merge when our document already contains the
+                // commit's changes
+                if (!this.headsInHistory(state, commitHeads)) {
+                  // Merge a clone outside the store update: Automerge.merge
+                  // consumes its target, so a failure mid-merge must not
+                  // leave the live document frozen
+                  const next = this.mergeRebuilt(
+                    Automerge.clone(state, Automerge.getActorId(state)),
+                    commitState
+                  );
+                  this._state.set(next);
+                  freeDocLater(state);
+                  this.drainPendingRemoteChanges();
+                }
+              } finally {
+                // Released on BOTH paths: the already-in-history skip is
+                // the common case (ChangeNotice delivers the changes before
+                // the commit notice), and leaking here costs one full doc
+                // per snapshot commit per participant
+                freeDoc(commitState);
+              }
             }
           } catch (error) {
             // Don't adopt a tip whose content we couldn't absorb: our next
@@ -297,6 +492,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
 
           this._currentTip.set(newCommit);
           this._tipHeads = commitHeads;
+          this._tipDepth = payload.kind === 'delta' ? payload.depth : 0;
           // Refresh the save point and clear the divergence clock if the
           // commit covered our local changes; otherwise the clock keeps
           // running so a non-leader can still take over committing what
@@ -447,6 +643,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     this._currentTip = writable(currentTip);
     // At join, the session state is exactly the resolved tip state
     this._tipHeads = currentTip ? Automerge.getHeads(currentState) : undefined;
+    this._tipDepth = currentTip ? commitDepth(currentTip.entry) : 0;
 
     const participantsMap: AgentPubKeyMap<SessionParticipant> =
       new AgentPubKeyMap();
@@ -456,6 +653,21 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
         lastSeen: Date.now(),
         firstSeen: Date.now(),
         lastActive: this.myPubKey === p ? Date.now() : undefined,
+        syncStates: {
+          state: Automerge.initSyncState(),
+          ephemeral: Automerge.initSyncState(),
+        },
+      });
+    }
+    // Seed the local agent here, not in the participants derived transform:
+    // the DHT participant list may not include us yet, and a transform that
+    // mutates the writable's own value desynchronizes the map from what
+    // subscribers were notified with
+    if (!participantsMap.has(this.myPubKey)) {
+      participantsMap.set(this.myPubKey, {
+        lastSeen: Date.now(),
+        firstSeen: Date.now(),
+        lastActive: Date.now(),
         syncStates: {
           state: Automerge.initSyncState(),
           ephemeral: Automerge.initSyncState(),
@@ -485,14 +697,29 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       );
 
     const currentTip = await toPromise(workspaceStore.tip);
-    const currentState: S = await toPromise(workspaceStore.latestSnapshot);
+    // The session's live document must be a real Automerge doc; resolve it
+    // directly (latestSnapshot serves materialized plain snapshots). The
+    // session takes ownership: it is freed in leaveSession.
+    let currentState: Automerge.Doc<S>;
+    if (currentTip) {
+      currentState = (await workspaceStore.documentStore.resolveCommitState(
+        currentTip
+      )) as Automerge.Doc<S>;
+    } else {
+      const documentRecord = await toPromise(
+        workspaceStore.documentStore.record
+      );
+      currentState = stateFromDocument(
+        documentRecord.entry
+      ) as Automerge.Doc<S>;
+    }
     const sessionStatus: SessionStatus = { code: 'ok', lastSave: currentTip ? new Date(currentTip.action.timestamp).toISOString() : '' };
 
     return new SessionStore(
       workspaceStore,
       onLeave,
       config,
-      currentState as Automerge.Doc<S>,
+      currentState,
       currentTip,
       sessionStatus,
       participants
@@ -560,14 +787,13 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     if (this._tipHeads) {
       inSync = this.inSyncWithTip();
     } else {
-      // Nothing committed yet: in sync only if we match the initial snapshot
+      // Nothing committed yet: in sync only if we match the initial
+      // snapshot. latestSnapshot serves materialized plain values, so
+      // compare content against a materialization of the live doc.
       const latestSnapshot = await toPromise(
         this.workspaceStore.latestSnapshot
       );
-      inSync = this.statesEqual(
-        latestSnapshot as Automerge.Doc<S>,
-        get(this._state)
-      );
+      inSync = isEqual(latestSnapshot, Automerge.toJS(get(this._state)));
     }
     if (inSync) {
       this._divergedSince = undefined;
@@ -609,74 +835,115 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   change(updateFn: (state: S, ephemeral: E) => void) {
-    this._state.update(state => {
-      let newState = state;
-      this._ephemeral.update(ephemeralState => {
-        let newEphemeralState = ephemeralState;
+    const state = get(this._state);
+    const ephemeralState = get(this._ephemeral);
 
-        newState = Automerge.change(newState, doc => {
-          newEphemeralState = Automerge.change(newEphemeralState, eph => {
-            updateFn(doc as S, eph as E);
-          });
+    // The transaction runs in place on the live handle: automerge wasm
+    // documents are never reclaimed by the JS GC, so a clone per keystroke
+    // leaks its full doc size permanently and kills the module at the wasm
+    // memory cap. Panic safety comes from the no-parked-changes invariant
+    // (the panic precondition never forms) plus the catch below — a plain
+    // throw from the grammar's updateFn rolls back cleanly and leaves the
+    // live doc untouched.
+    let newState: Automerge.Doc<S>;
+    let newEphemeralState: Automerge.Doc<E> | undefined;
+    let stateChanges: Uint8Array[];
+    let ephemeralChanges: Uint8Array[];
+    try {
+      newState = Automerge.change(state, doc => {
+        newEphemeralState = Automerge.change(ephemeralState, eph => {
+          updateFn(doc as S, eph as E);
         });
-
-        const stateChanges = Automerge.getChanges(state, newState);
-        const ephemeralChanges = Automerge.getChanges(
-          ephemeralState,
-          newEphemeralState
-        );
-        this.deltaCount += stateChanges.length;
-        if (stateChanges.length > 0 && this._divergedSince === undefined) {
-          this._divergedSince = Date.now();
-        }
-        if (
-          this.config.commitStrategy.CommitEveryNDeltas &&
-          this.deltaCount > this.config.commitStrategy.CommitEveryNDeltas &&
-          this.amILeader() &&
-          this.viewIsStable() &&
-          Date.now() >= this._backoffUntil &&
-          !this.commitInFlight()
-        ) {
-          this._commitChanges();
-          console.log("Committing changes due to delta count.");
-        } else if (stateChanges.length > 0) {
-          this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
-        }
-
-        const participantsArray = Array.from(get(this._participants).keys()) as AgentPubKey[];
-        const otherParticipants = participantsArray.filter(
-          p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
-        );
-
-        // Set me to active
-        this._participants.update(p => {
-            const info = p.get(this.myPubKey);
-            if (info) {
-                p.set(this.myPubKey, {
-                    ...info,
-                    lastActive: Date.now(),
-                    lastSeen: Date.now(),
-                });
-            }
-            return p;
-        });
-
-        this.workspaceStore.documentStore.synStore.client.sendMessage(
-          otherParticipants,
-          {
-            workspace_hash: this.workspaceStore.workspaceHash,
-            payload: {
-              type: 'ChangeNotice',
-              state_changes: stateChanges.map(c => encode(c) as any),
-              ephemeral_changes: ephemeralChanges.map(c => encode(c) as any),
-            },
-          }
-        );
-        return newEphemeralState;
       });
+    } catch (error) {
+      // A throwing grammar updateFn rolls back BOTH transactions (the
+      // inner ephemeral one aborts with it) and the live docs are
+      // untouched. But if the inner ephemeral transaction committed and
+      // the OUTER commit then threw, the ephemeral handle has advanced —
+      // the store must be re-pointed at the committed proxy or every
+      // later ephemeral edit fails on an outdated document.
+      if (newEphemeralState !== undefined) {
+        this._ephemeral.set(newEphemeralState);
+      }
+      console.error('syn: change failed; state document unchanged:', error);
+      throw error;
+    }
+    // The transactions committed on the live handles: the stores MUST be
+    // re-pointed at the new proxies before anything else that can throw,
+    // or they'd be left holding outdated proxies that fail every later
+    // change with "Attempting to change an outdated document"
+    this._state.set(newState);
+    this._ephemeral.set(newEphemeralState!);
 
-      return newState;
+    try {
+      stateChanges = Automerge.getChanges(state, newState);
+      ephemeralChanges = Automerge.getChanges(
+        ephemeralState,
+        newEphemeralState!
+      );
+    } catch (error) {
+      // ChangeCollector failure after a committed edit: the stores are
+      // current but the change bytes can't be extracted for broadcast;
+      // peers converge through the commit and sync machinery instead
+      console.error(
+        'syn: failed to extract committed changes for broadcast:',
+        error
+      );
+      if (this._divergedSince === undefined) this._divergedSince = Date.now();
+      this._sessionStatus.set({
+        code: 'syncing',
+        lastSave: get(this.sessionStatus).lastSave,
+      });
+      return;
+    }
+
+    this.deltaCount += stateChanges.length;
+    if (stateChanges.length > 0 && this._divergedSince === undefined) {
+      this._divergedSince = Date.now();
+    }
+    if (
+      this.config.commitStrategy.CommitEveryNDeltas &&
+      this.deltaCount > this.config.commitStrategy.CommitEveryNDeltas &&
+      this.amILeader() &&
+      this.viewIsStable() &&
+      Date.now() >= this._backoffUntil &&
+      !this.commitInFlight()
+    ) {
+      this._commitChanges();
+      console.log("Committing changes due to delta count.");
+    } else if (stateChanges.length > 0) {
+      this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
+    }
+
+    const participantsArray = Array.from(get(this._participants).keys()) as AgentPubKey[];
+    const otherParticipants = participantsArray.filter(
+      p => encodeHashToBase64(p) !== encodeHashToBase64(this.myPubKey)
+    );
+
+    // Set me to active
+    this._participants.update(p => {
+        const info = p.get(this.myPubKey);
+        if (info) {
+            p.set(this.myPubKey, {
+                ...info,
+                lastActive: Date.now(),
+                lastSeen: Date.now(),
+            });
+        }
+        return p;
     });
+
+    this.workspaceStore.documentStore.synStore.client.sendMessage(
+      otherParticipants,
+      {
+        workspace_hash: this.workspaceStore.workspaceHash,
+        payload: {
+          type: 'ChangeNotice',
+          state_changes: stateChanges.map(c => encode(c) as any),
+          ephemeral_changes: ephemeralChanges.map(c => encode(c) as any),
+        },
+      }
+    );
   }
 
   private handleChangeNotice(
@@ -702,24 +969,85 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       this._divergedSince = Date.now();
     }
 
-    this._state.update(state => {
-      const [updatedState] = Automerge.applyChanges(state, stateChanges);
+    this.applyRemoteStateChanges(stateChanges, from);
 
-      return updatedState;
-    });
-
-    this._ephemeral.update(ephemeral => {
-      const [updatedEphemeral] = Automerge.applyChanges(
-        ephemeral,
-        ephemeralChanges
-      );
-
-      return updatedEphemeral;
-    });
+    // Ephemeral state is best-effort by design: apply what's applicable,
+    // drop the rest — but never let applyChanges park changes inside the
+    // live doc or run against the live handle
+    if (ephemeralChanges.length > 0) {
+      try {
+        const ephemeral = get(this._ephemeral);
+        const result = applyAvailableChanges(ephemeral, ephemeralChanges);
+        if (result.appliedCount > 0) {
+          this._ephemeral.set(result.doc);
+          if (result.rebuilt) freeDocLater(ephemeral);
+        }
+      } catch (error) {
+        console.error('syn: failed to apply ephemeral changes:', error);
+      }
+    }
 
     if (stateChanges.length > 0) {
       this._sessionStatus.set({ code: 'syncing', lastSave: get(this.sessionStatus).lastSave });
     }
+  }
+
+  // Apply incoming remote changes together with any buffered ones, keeping
+  // the invariant that the live doc never internally parks changes with
+  // missing dependencies (automerge#1327): what can't be applied yet is
+  // buffered in _pendingRemoteChanges and retried on the next delivery,
+  // sync response, or commit. On a contained wasm failure the live doc is
+  // untouched and we converge over the sync channel instead.
+  private applyRemoteStateChanges(incoming: Uint8Array[], from?: AgentPubKey) {
+    const now = Date.now();
+    const kept = this._pendingRemoteChanges.filter(
+      p => now - p.receivedAt < PENDING_REMOTE_CHANGE_TTL_MS
+    );
+    if (incoming.length === 0 && kept.length === 0) {
+      this._pendingRemoteChanges = kept;
+      return;
+    }
+    const receivedAt = new Map(kept.map(p => [p.bytes, p.receivedAt] as const));
+    const state = get(this._state);
+    try {
+      const result = applyAvailableChanges(state, [
+        ...kept.map(p => p.bytes),
+        ...incoming,
+      ]);
+      if (result.appliedCount > 0) {
+        this._state.set(result.doc);
+        // on the rare parked-fallback rebuild the old live handle is
+        // superseded; release it after the grace window
+        if (result.rebuilt) freeDocLater(state);
+      }
+      this._pendingRemoteChanges = result.deferred
+        .slice(-MAX_PENDING_REMOTE_CHANGES)
+        .map(bytes => ({ bytes, receivedAt: receivedAt.get(bytes) ?? now }));
+      if (result.deferred.length > 0 && from) {
+        // The sender either has the missing dependencies or authored the
+        // gap; an interactive sync closes it without waiting for retries
+        this.requestSync(from);
+      }
+    } catch (error) {
+      // No newer proxy exists to re-point the store at (applyChanges
+      // yields one only on success); a mid-apply wasm failure may still
+      // have advanced the handle, in which case later operations surface
+      // it and the sync channel is the recovery path either way
+      console.error(
+        'syn: failed to apply remote changes; converging via sync:',
+        error
+      );
+      // Keep the buffer pruned of expired entries even on the failure path
+      this._pendingRemoteChanges = kept;
+      if (from) this.requestSync(from);
+    }
+  }
+
+  // Retry buffered remote changes; called after anything that may have
+  // delivered their missing dependencies (sync responses, adopted commits)
+  private drainPendingRemoteChanges() {
+    if (this._pendingRemoteChanges.length === 0) return;
+    this.applyRemoteStateChanges([]);
   }
 
   requestSync(participant: AgentPubKey) {
@@ -727,12 +1055,28 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     if (!participantEntry) return;
     const syncStates = participantEntry.syncStates;
 
-    const [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
-      get(this._state),
-      syncStates.state
-    );
-    const [ephemeralNextSyncState, ephemeralSyncMessage] =
-      Automerge.generateSyncMessage(get(this._ephemeral), syncStates.ephemeral);
+    // generateSyncMessage reconstructs changes by hash (the ChangeCollector
+    // path that can panic, automerge#1327). It reads without mutating, the
+    // no-parked-changes invariant keeps its panic precondition away, and a
+    // clone here would leak permanently (wasm docs are never GC-reclaimed)
+    // — so run it on the live docs and contain failures with the catch.
+    let nextSyncState: Automerge.SyncState;
+    let syncMessage: Uint8Array | null;
+    let ephemeralNextSyncState: Automerge.SyncState;
+    let ephemeralSyncMessage: Uint8Array | null;
+    try {
+      [nextSyncState, syncMessage] = Automerge.generateSyncMessage(
+        get(this._state),
+        syncStates.state
+      );
+      [ephemeralNextSyncState, ephemeralSyncMessage] =
+        Automerge.generateSyncMessage(get(this._ephemeral), syncStates.ephemeral);
+    } catch (error) {
+      // Skip this round; the periodic machinery (discovery polls,
+      // heartbeats, commit flow) retries syncing soon after
+      console.error('syn: generateSyncMessage failed; skipping sync round:', error);
+      return;
+    }
 
     this._participants.update(p => {
       const info = p.get(participant);
@@ -770,47 +1114,91 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     syncMessage: Uint8Array | undefined,
     ephemeralSyncMessage: Uint8Array | undefined
   ) {
+    const participantInfo = get(this._participants).get(from);
+    if (!participantInfo) return;
+
+    let stateAdvanced = false;
+    if (syncMessage) {
+      const state = get(this._state);
+      let next: Automerge.Doc<S> | undefined;
+      try {
+        // In place: wasm docs are never GC-reclaimed, so a clone per sync
+        // round leaks permanently. Failure containment is the catch below.
+        const [nextDoc, nextSyncState, _message] =
+          Automerge.receiveSyncMessage(
+            state,
+            participantInfo.syncStates.state,
+            syncMessage
+          );
+        // Defensive: the sync protocol shouldn't deliver changes with
+        // missing dependencies, but a doc that internally parks them is
+        // one MissingOps panic away from being poisoned (automerge#1327).
+        // stripParked is a cheap check on a clean doc. On the rare rebuild
+        // the superseded handle — until a moment ago the LIVE doc's handle
+        // (receiveSyncMessage ran in place) — is released only after the
+        // grace window, since an async reader may still hold a proxy of it.
+        next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
+        const changes = Automerge.getChanges(state, next);
+        participantInfo.syncStates.state = nextSyncState;
+        this._state.set(next);
+        if (next !== nextDoc) freeDocLater(nextDoc);
+        this.deltaCount += changes.length;
+        if (changes.length > 0 && this._divergedSince === undefined) {
+          this._divergedSince = Date.now();
+        }
+        stateAdvanced = changes.length > 0;
+      } catch (error) {
+        // The half-advanced sync state is untrustworthy after a failure;
+        // restarting the conversation costs one extra negotiation round.
+        // receiveSyncMessage ran in place, so when a newer valid proxy
+        // exists the store must be re-pointed at it — otherwise the store
+        // keeps an outdated proxy and every later operation throws.
+        console.error(
+          'syn: sync receive failed; restarting sync with peer:',
+          error
+        );
+        if (next !== undefined) this._state.set(next);
+        participantInfo.syncStates.state = Automerge.initSyncState();
+        this._sessionStatus.set({
+          code: 'syncing',
+          lastSave: get(this.sessionStatus).lastSave,
+        });
+      }
+    }
+
+    if (ephemeralSyncMessage) {
+      const ephemeral = get(this._ephemeral);
+      let next: Automerge.Doc<E> | undefined;
+      try {
+        const [nextDoc, nextSyncState, _message] =
+          Automerge.receiveSyncMessage(
+            ephemeral,
+            participantInfo.syncStates.ephemeral,
+            ephemeralSyncMessage
+          );
+        participantInfo.syncStates.ephemeral = nextSyncState;
+        // see the state branch above for the grace-window release
+        next = hasParkedChanges(nextDoc) ? stripParked(nextDoc) : nextDoc;
+        this._ephemeral.set(next);
+        if (next !== nextDoc) freeDocLater(nextDoc);
+      } catch (error) {
+        console.error(
+          'syn: ephemeral sync receive failed; restarting sync:',
+          error
+        );
+        if (next !== undefined) this._ephemeral.set(next);
+        participantInfo.syncStates.ephemeral = Automerge.initSyncState();
+      }
+    }
+
     this._participants.update(p => {
-      const participantInfo = p.get(from);
-      if (!participantInfo) return p;
-
-      if (syncMessage) {
-        this._state.update(state => {
-          const [nextDoc, nextSyncState, _message] =
-            Automerge.receiveSyncMessage(
-              state,
-              participantInfo.syncStates.state,
-              syncMessage
-            );
-          const changes = Automerge.getChanges(state, nextDoc);
-          this.deltaCount += changes.length;
-          if (changes.length > 0 && this._divergedSince === undefined) {
-            this._divergedSince = Date.now();
-          }
-
-          participantInfo.syncStates.state = nextSyncState;
-          return nextDoc;
-        });
-      }
-
-      if (ephemeralSyncMessage) {
-        this._ephemeral.update(ephemeral => {
-          const [nextDoc, nextSyncState, _message] =
-            Automerge.receiveSyncMessage(
-              ephemeral,
-              participantInfo.syncStates.ephemeral,
-              ephemeralSyncMessage
-            );
-
-          participantInfo.syncStates.ephemeral = nextSyncState;
-
-          return nextDoc;
-        });
-      }
-
       p.set(from, participantInfo);
       return p;
     });
+
+    // A sync response may have delivered the dependencies buffered
+    // ChangeNotice changes were waiting on
+    if (stateAdvanced) this.drainPendingRemoteChanges();
 
     this.requestSync(from);
   }
@@ -852,28 +1240,22 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     );
   }
 
-  // Merge `other` into `doc` and rebuild the doc through a save/load
-  // round-trip. The round-trip works around an automerge bug where merged
-  // documents can be left with internal index gaps that later make change
-  // commits or sync-message generation panic inside the wasm module
+  // Merge `other` into `doc` and rebuild the doc through an
+  // actor-preserving save/load round-trip: merged documents can be left
+  // with internal index gaps that later make change commits or
+  // sync-message generation panic inside the wasm module
   // (https://github.com/automerge/automerge/issues/1327).
+  // Both call sites pass a caller-owned clone as `doc`; the merged handle
+  // is superseded by the rebuilt doc and released here (wasm docs are
+  // never GC-reclaimed).
   private mergeRebuilt(
     doc: Automerge.Doc<S>,
     other: Automerge.Doc<S>
   ): Automerge.Doc<S> {
-    // Preserve the doc's actor id: load() without one assigns a fresh
-    // random actor on every rebuild, accumulating actors in the document
-    // metadata over the life of a session
-    const actor = Automerge.getActorId(doc);
     const merged = Automerge.merge(doc, other);
-    return Automerge.load(Automerge.save(merged), { actor }) as Automerge.Doc<S>;
-  }
-
-  // Whether two docs hold the same content, even if their change histories
-  // (and therefore their serialized forms) differ
-  private statesEqual(a: Automerge.Doc<S>, b: Automerge.Doc<S>): boolean {
-    if (isEqual(Automerge.save(a), Automerge.save(b))) return true;
-    return isEqual(Automerge.toJS(a), Automerge.toJS(b));
+    const rebuilt = rebuildConsistent(merged);
+    freeDoc(merged);
+    return rebuilt;
   }
 
   private notifyNewCommit(newCommit: EntryRecord<Commit>) {
@@ -904,6 +1286,9 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
   }
 
   private async commitChangesInternal(meta?: any) {
+    // A commit queued before leaveSession may run after it; the live docs
+    // are freed then, so touching them would be a use-after-free
+    if (this._left) return;
     const tipAtStart = get(this._currentTip);
     if (this._tipHeads && tipAtStart) {
       if (this.inSyncWithTip()) {
@@ -916,9 +1301,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       const latestSnapshot = await toPromise(
         this.workspaceStore.latestSnapshot
       );
-      if (
-        this.statesEqual(latestSnapshot as Automerge.Doc<S>, get(this._state))
-      ) {
+      if (isEqual(latestSnapshot, Automerge.toJS(get(this._state)))) {
         // Nothing to commit, just return
         this._divergedSince = undefined;
         this._sessionStatus.set({
@@ -933,14 +1316,16 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       meta = encode(meta);
     }
 
-    // Check if there are multiple workspace tips that need to be merged
-    const workspaceTips = await this.workspaceStore.getCurrentTips();
+    // Check if there are multiple distinct workspace tips that need merging.
+    // Tips sharing an entry hash are byte-identical commits authored
+    // concurrently and don't count as divergence.
+    const tipGroups = await this.workspaceStore.getCurrentTipGroups();
     let currentTip = get(this._currentTip);
 
-    if (workspaceTips.length > 1) {
-      console.log('Multiple workspace tips detected during session commit, merging:', workspaceTips.map(h => encodeHashToBase64(h)));
+    if (tipGroups.length > 1) {
+      console.log('Multiple workspace tips detected during session commit, merging:', tipGroups.flat().map(h => encodeHashToBase64(h)));
       // Merge the tips before creating our commit
-      const mergedCommit = await this.workspaceStore.merge(workspaceTips);
+      const mergedCommit = await this.workspaceStore.merge(tipGroups.flat());
 
       // Bring the merged state into our own document; otherwise the commit
       // below would replace the merge with our pre-merge snapshot. Only
@@ -956,11 +1341,14 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
           mergedState
         );
         this._state.set(next);
+        freeDocLater(state);
       }
+      freeDoc(mergedState);
 
       currentTip = mergedCommit;
       this._currentTip.set(mergedCommit);
       this._tipHeads = mergedHeads;
+      this._tipDepth = 0;
 
       // If the merge already contains everything we have locally, the merge
       // commit is the new tip and the only thing to broadcast: there is
@@ -978,8 +1366,69 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       }
     }
 
-    const previous_commit_hashes = currentTip ? [currentTip.actionHash] : [];
+    // Supersede every action hash of the tip's group: concurrently authored
+    // identical entries must all stop being tips
+    let previous_commit_hashes: Array<ActionHash> = [];
+    if (currentTip) {
+      const tipB64 = encodeHashToBase64(currentTip.actionHash);
+      const group = tipGroups.find(g =>
+        g.some(h => encodeHashToBase64(h) === tipB64)
+      );
+      previous_commit_hashes = group ?? [currentTip.actionHash];
+    }
+
     const stateAtCommit = get(this._state);
+    const stateHeads = Automerge.getHeads(stateAtCommit);
+
+    // Store only the changes since the tip; write a full snapshot for the
+    // first commit, when the delta chain has reached the snapshot cadence,
+    // or when the tip's heads aren't fully part of our history
+    const snapshotEvery = this.config.commitStrategy.SnapshotEveryNCommits;
+    const canDelta =
+      !!currentTip &&
+      !!this._tipHeads &&
+      this._tipDepth + 1 < snapshotEvery &&
+      this.headsInHistory(stateAtCommit, this._tipHeads);
+
+    let payload: CommitPayload | undefined;
+    let newDepth = 0;
+    if (canDelta) {
+      // saveSince can panic (MissingOps) when the live doc carries
+      // out-of-order/pending changes from rapid ChangeNotice traffic — a
+      // state Automerge.save() tolerates but the incremental encoder does
+      // not. Compute the delta on a clone so a panic poisons only the
+      // throwaway doc and never the live session document, and fall back to
+      // a full snapshot when it can't produce a clean delta.
+      let clone: Automerge.Doc<S> | undefined;
+      try {
+        clone = Automerge.clone(
+          stateAtCommit,
+          Automerge.getActorId(stateAtCommit)
+        );
+        const data = Automerge.saveSince(clone, this._tipHeads!);
+        newDepth = this._tipDepth + 1;
+        payload = {
+          kind: 'delta',
+          data,
+          heads: stateHeads,
+          depth: newDepth,
+        };
+      } catch (error) {
+        console.warn(
+          'saveSince failed; falling back to a snapshot commit:',
+          error
+        );
+        newDepth = 0;
+      } finally {
+        // one full-doc clone per delta commit would otherwise leak
+        // permanently (wasm docs are never GC-reclaimed)
+        if (clone !== undefined) freeDoc(clone);
+      }
+    }
+    if (!payload) {
+      payload = { kind: 'snapshot', data: Automerge.save(stateAtCommit) };
+    }
+
     const commit: Commit = {
       authors: [
         ...(Array.from(get(this._participants).keys()) as AgentPubKey[]),
@@ -987,7 +1436,7 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       ],
       meta,
       previous_commit_hashes,
-      state: encode(Automerge.save(stateAtCommit)),
+      state: encodeCommitPayload(payload),
       witnesses: [],
       document_hash: this.workspaceStore.documentStore.documentHash,
     };
@@ -996,7 +1445,8 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
       const newCommit = await this.synClient.createCommit(commit);
 
       this._currentTip.set(newCommit);
-      this._tipHeads = Automerge.getHeads(stateAtCommit);
+      this._tipHeads = stateHeads;
+      this._tipDepth = newDepth;
       this.notifyNewCommit(newCommit);
 
       await this.synClient.updateWorkspaceTip(
@@ -1052,6 +1502,46 @@ export class SessionStore<S, E> implements SliceStore<S, E> {
     for (const interval of this.intervals) {
       clearInterval(interval);
     }
+    // No new commits start after this point, and any in-flight commit must
+    // finish before the live docs are freed — a queued commit resuming
+    // after the free would call into a freed wasm handle ("null pointer
+    // passed to rust"). The drain is bounded: a commit stuck on the DHT
+    // (e.g. resolving a commit chain that hasn't gossiped over) must not
+    // hang leaveSession forever, and on timeout the frees are skipped —
+    // a bounded leak beats a use-after-free.
+    this._left = true;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      this._commitQueue.catch(() => {}).then(() => true),
+      new Promise<false>(resolve => {
+        drainTimer = setTimeout(
+          () => resolve(false),
+          LEAVE_COMMIT_DRAIN_TIMEOUT_MS
+        );
+      }),
+    ]);
+    clearTimeout(drainTimer);
+    if (drained) {
+      // The session is finished: release its live documents (wasm docs are
+      // never GC-reclaimed, so join/leave cycles would otherwise accumulate
+      // a doc per session). Using this store after leaveSession is invalid.
+      freeDoc(get(this._state));
+      freeDoc(get(this._ephemeral));
+    } else {
+      console.warn(
+        'syn: leaveSession: a commit was still in flight after ' +
+          LEAVE_COMMIT_DRAIN_TIMEOUT_MS +
+          'ms; deferring the session document release until it settles'
+      );
+      // _left guarantees no new commits enter the queue, so whenever the
+      // stuck commit finally settles nothing else can touch the docs:
+      // the leak becomes a deferred cleanup instead of a permanent one
+      this._commitQueue.catch(() => {}).then(() => {
+        freeDoc(get(this._state));
+        freeDoc(get(this._ephemeral));
+      });
+    }
+    this._pendingRemoteChanges = [];
     this.onLeave();
   }
 

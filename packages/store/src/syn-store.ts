@@ -11,6 +11,10 @@ import * as Automerge from '@automerge/automerge'
 import { slice } from '@holochain-open-dev/utils';
 import { AnyDhtHash, EntryHash, LazyHoloHashMap } from '@holochain/client';
 
+// Local stand-in for the LazyMap that @holochain-open-dev/utils no longer
+// exports with this signature after the 0.601.x dependency bumps: a plain
+// keyed memoizing factory (string/tag keys, so LazyHoloHashMap's
+// hash-normalized keying doesn't apply)
 class LazyMap<K, V> {
   private map = new Map<K, V>();
   constructor(private factory: (key: K) => V) {}
@@ -22,10 +26,21 @@ class LazyMap<K, V> {
 
 import { DocumentStore } from './document-store.js';
 import { LINKS_POLL_INTERVAL_MS } from './config.js';
+import { decodeCommitPayload } from './commit-payload.js';
+import { freeDoc } from './automerge-safe.js';
 
+/** Load the document state carried by a SNAPSHOT commit. Delta commits do
+ *  not carry full state and are rejected here — reconstruct them with
+ *  `DocumentStore.resolveCommitState()`, which walks the chain back to the
+ *  snapshot ancestor. */
 export const stateFromCommit = (commit: Commit) => {
-  const commitState = decode(commit.state) as Uint8Array;
-  const state = Automerge.load(commitState);
+  const payload = decodeCommitPayload(commit.state);
+  if (payload.kind !== 'snapshot') {
+    throw new Error(
+      'Cannot load state from a delta commit alone: use DocumentStore.resolveCommitState() to reconstruct it from its snapshot ancestor'
+    );
+  }
+  const state = Automerge.load(payload.data);
   return state;
 };
 
@@ -81,10 +96,12 @@ export class SynStore {
 
   async createDocument<S extends Record<string, unknown>>(initialState: S, meta?: any) {
     let doc: Automerge.Doc<any> = Automerge.from(initialState);
+    const initialStateBytes = encode(Automerge.save(doc));
+    freeDoc(doc);
 
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
-      initial_state: encode(Automerge.save(doc)),
+      initial_state: initialStateBytes,
     });
 
     return this.documents.get(documentRecord.actionHash);
@@ -98,10 +115,12 @@ export class SynStore {
     doc = Automerge.change(doc, { time: 0 }, d =>
       Object.assign(d, initialState)
     );
+    const initialStateBytes = encode(Automerge.save(doc));
+    freeDoc(doc);
 
     const documentRecord = await this.client.createDocument({
       meta: meta ? encode(meta) : undefined,
-      initial_state: encode(Automerge.save(doc)),
+      initial_state: initialStateBytes,
     });
 
     return this.documents.get(documentRecord.entryHash);

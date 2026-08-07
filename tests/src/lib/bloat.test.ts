@@ -11,7 +11,7 @@ import {
   sampleGrammar,
   synHapp,
   waitForOtherParticipants,
-  waitUntil,
+  waitForTextConvergence,
 } from '../common.js';
 import { textEditorGrammar } from '../text-editor-grammar.js';
 import { AppBundleSource } from '@holochain/client';
@@ -103,19 +103,10 @@ test('a large amount of changes does not break editing', async () => {
     //await delay(2000);
     await dhtSync([alice, bob], alice.cells[0].cell_id[0]);
 
-    // Wait until bob's doc has actually received all of alice's bloat
-    // content; typing into a not-yet-synced doc anchors the first
-    // characters at a stale position and they end up interleaved
-    // (same guard as in concurrent.test.ts)
-    await waitUntil(
-      () =>
-        get(bobSessionStore.state).body.text.join('') ===
-        get(aliceSessionStore.state).body.text.join(''),
-      30_000
-    );
-    assert.equal(
-      get(bobSessionStore.state).body.text.join(''),
-      get(aliceSessionStore.state).body.text.join(''),
+    await waitForTextConvergence(
+      aliceSessionStore,
+      bobSessionStore,
+      30_000,
       'precondition: bloat content synced to bob before typing starts'
     );
 

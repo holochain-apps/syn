@@ -20,6 +20,7 @@ export default defineConfig({
           { text: 'Welcome to Syn', link: '/welcome-to-syn' },
           { text: 'Quickstart', link: '/quickstart' },
           { text: 'Design', link: '/design' },
+          { text: 'Automerge memory model', link: '/automerge-memory' },
         ],
       },
       {
