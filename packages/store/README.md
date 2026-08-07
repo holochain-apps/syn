@@ -143,16 +143,34 @@ await sessionStore.commitChanges(
 
 ## Migration notes (0.601.x → 0.603.0)
 
+**This is a fully breaking release with a new DNA.** Rebuilding the syn
+zomes against holochain 0.6.3 (hdk 0.6.3 / hdi 0.7.3) changes the
+integrity wasm and therefore the **DNA hash** — verified, same zome
+source under hdk 0.6.0 vs 0.6.3 yields two different hashes. A different
+DNA hash is a different DHT: existing networks and the data in them are
+not migrated, not readable from the new DNA, and not corrupted either —
+they simply stay where they are, reachable only by the old version.
+
+Consequences, all deliberate:
+
+- **Ship a full version bump of your UI together with the new DNA.**
+  There is no supported path that upgrades the client packages while
+  keeping an existing DNA, and no in-place migration of existing DHT
+  data. Plan a fresh network (or an application-level export/import) for
+  content you need to carry over.
+- Old and new clients can never meet on the same DHT, so the delta-commit
+  format change below cannot strand an old client mid-network.
+
 The minor encodes the holochain version this release is built and tested
-against: **holochain 0.6.3** (hdk 0.6.3 / hdi 0.7.3). There is no 0.602.x
-— we never shipped against holochain 0.6.2.
+against: **holochain 0.6.3**. There is no 0.602.x — we never shipped
+against holochain 0.6.2.
 
 Dependency ranges are deliberately permissive: `@holochain/client` is
 `^0.20.5`, so anything from 0.20.5 through the 0.20 line (0.20.8 is what
 CI tests against) resolves to a single copy. Nothing in the published
 dependency chain is hard-pinned.
 
-Breaking or behavior-affecting changes for existing callers:
+API changes for existing callers:
 
 - **`SynConfig`**: the misspelled `hearbeatInterval` was renamed to
   `heartbeatInterval` (a caller still passing the old key silently gets
@@ -168,8 +186,9 @@ Breaking or behavior-affecting changes for existing callers:
   object identity (e.g. cursor element ids) use the new read-only
   `docState` on `SliceStore`. See `docs/automerge-memory.md` for why.
 - **Delta commits are a one-way format change**: clients older than
-  0.603.0 read every commit as a bare snapshot binary and fail on the
-  first delta commit written to a shared DHT. Upgrade all clients of a
-  shared network before relying on delta commits.
+  0.603.0 read every commit as a bare snapshot binary and cannot
+  interpret a delta commit. This release's new DNA hash keeps old and
+  new clients on separate networks, so it only matters if you
+  deliberately reuse commit data across versions.
 - **`leaveSession` invalidates the store**: it releases the session's
   wasm documents; unmount `docState` consumers before calling it.

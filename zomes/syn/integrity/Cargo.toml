@@ -2,7 +2,7 @@
 authors = ["eric.harris-braun@holo.host"]
 edition = "2021"
 name = "hc_zome_syn_integrity"
-version = "0.2.0"
+version = "0.3.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

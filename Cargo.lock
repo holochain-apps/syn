@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "hc_zome_syn_coordinator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hc_zome_syn_integrity",
  "hdk",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "hc_zome_syn_integrity"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hdi",
  "holochain_serialized_bytes",
