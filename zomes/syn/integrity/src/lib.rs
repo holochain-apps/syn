@@ -228,19 +228,85 @@ fn validate_create_link(
 
 fn validate_delete_link(
     link_type: LinkTypes,
-    author: &AgentPubKey,
-    create_author: &AgentPubKey,
+    action: &TypedAction<DeleteLinkData>,
+    original: &CreateLinkData,
+    original_author: &AgentPubKey,
 ) -> ExternResult<ValidateCallbackResult> {
     match link_type {
         LinkTypes::WorkspaceToParticipant => {
             // only the participant themselves may retract their session link
-            if author == create_author {
+            if action.author() == original_author {
                 Ok(ValidateCallbackResult::Valid)
             } else {
                 invalid("WorkspaceToParticipant links may only be deleted by their author")
             }
         },
+        LinkTypes::WorkspaceToTip => validate_workspace_tip_delete(action, original),
         _ => Ok(ValidateCallbackResult::Valid),
+    }
+}
+
+fn is_workspace_to_tip(link: &CreateLinkData) -> ExternResult<bool> {
+    Ok(matches!(
+        LinkTypes::from_type(link.zome_index, link.link_type)?,
+        Some(LinkTypes::WorkspaceToTip)
+    ))
+}
+
+/// A tip link may only be retracted by the same chain write that supersedes
+/// it: the deleter's previous action must be the superseding WorkspaceToTip
+/// create on the same workspace, whose tag lists the retracted tip, or an
+/// earlier retraction from that same write. Because a delete is only valid
+/// once its previous action is, this anchors every retraction to its create,
+/// one step at a time. The delete's ops then cannot be integrated anywhere
+/// before the create's are, so no peer ever sees a workspace with its old tip
+/// retracted and the new one still pending.
+fn validate_workspace_tip_delete(
+    action: &TypedAction<DeleteLinkData>,
+    superseded: &CreateLinkData,
+) -> ExternResult<ValidateCallbackResult> {
+    let Some(prev_action_hash) = action.prev_action() else {
+        return invalid("WorkspaceToTip delete must follow the create that supersedes it");
+    };
+    let previous = must_get_valid_record(prev_action_hash.clone())?;
+    match &previous.action().data {
+        ActionData::CreateLink(create) => {
+            if !is_workspace_to_tip(create)? || create.base_address != superseded.base_address {
+                return invalid(
+                    "WorkspaceToTip delete must follow the WorkspaceToTip create that supersedes it",
+                );
+            }
+            let Some(retracted_tip) = superseded.target_address.clone().into_action_hash() else {
+                return invalid("WorkspaceToTip target must be an action hash");
+            };
+            let tag_bytes = SerializedBytes::from(UnsafeBytes::from(create.tag.clone().into_inner()));
+            let Ok(PreviousCommitsTag(superseded_tips)) = PreviousCommitsTag::try_from(tag_bytes) else {
+                return invalid("WorkspaceToTip tag must encode a PreviousCommitsTag");
+            };
+            if superseded_tips.contains(&retracted_tip) {
+                Ok(ValidateCallbackResult::Valid)
+            } else {
+                invalid("WorkspaceToTip delete may only retract a tip the new tip link supersedes")
+            }
+        },
+        ActionData::DeleteLink(previous_delete) => {
+            // an earlier retraction from the same write; its own validity
+            // anchors it to the create
+            let previous_original = must_get_valid_record(previous_delete.link_add_address.clone())?;
+            let ActionData::CreateLink(previous_create) = &previous_original.action().data else {
+                return invalid("DeleteLink must reference a CreateLink action");
+            };
+            if is_workspace_to_tip(previous_create)?
+                && previous_create.base_address == superseded.base_address
+            {
+                Ok(ValidateCallbackResult::Valid)
+            } else {
+                invalid(
+                    "WorkspaceToTip delete must follow the WorkspaceToTip create that supersedes it",
+                )
+            }
+        },
+        _ => invalid("WorkspaceToTip delete must follow the WorkspaceToTip create that supersedes it"),
     }
 }
 
@@ -274,7 +340,8 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
                 match LinkTypes::from_type(create_link.zome_index, create_link.link_type)? {
                     Some(link_type) => validate_delete_link(
                         link_type,
-                        action.author(),
+                        &action,
+                        create_link,
                         original.action().author(),
                     ),
                     // another zome's link type
@@ -309,7 +376,12 @@ pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
                 original_action,
                 link_type,
                 action,
-            } => validate_delete_link(link_type, action.author(), original_action.author()),
+            } => validate_delete_link(
+                link_type,
+                &action,
+                &original_action.data,
+                original_action.author(),
+            ),
         },
         FlatOp::Delete(op_delete) => {
             validate_delete_of_entry(op_delete.action.data.deletes_address.clone())

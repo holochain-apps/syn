@@ -95,7 +95,11 @@ pub fn update_workspace_tip(input: UpdateWorkspaceTipInput) -> ExternResult<()> 
 
     // Retract the tip links this commit supersedes so the link set doesn't
     // grow without bound; get_workspace_tips keeps pruning by tag for links
-    // whose deletes haven't propagated yet
+    // whose deletes haven't propagated yet.
+    // Validation only accepts a WorkspaceToTip retraction whose previous
+    // chain action is the superseding create (above) or an earlier
+    // retraction from this same write, so the deletes must stay here, after
+    // the create and with nothing else between them.
     let existing = get_links(
         LinkQuery::try_new(input.workspace_hash, LinkTypes::WorkspaceToTip)?,
         GetStrategy::Local,
