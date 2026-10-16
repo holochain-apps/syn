@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/text-editor",
-  "version": "0.701.0",
+  "version": "0.701.1",
   "description": "Collaborative text editing grammar and editor element for syn",
   "license": "CAL-1.0",
   "repository": {
@@ -33,7 +33,7 @@
     "@holochain-open-dev/profiles": "^0.702.0",
     "@holochain-open-dev/stores": "^0.701.0",
     "@holochain-open-dev/utils": "^0.701.0",
-    "@holochain-syn/core": "^0.701.0",
+    "@holochain-syn/core": "^0.701.1",
     "@holochain/client": "^0.21.1",
     "@lit/context": "^1.0.0",
     "@lit/localize": "^0.12.0",

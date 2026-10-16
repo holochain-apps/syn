@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/core",
-  "version": "0.701.0",
+  "version": "0.701.1",
   "description": "Contexts and Lit elements for building syn Holochain applications",
   "license": "CAL-1.0",
   "repository": {
@@ -33,8 +33,8 @@
     "@holochain-open-dev/stores": "^0.701.0",
     "@holochain-open-dev/utils": "^0.701.0",
     "@holochain/client": "^0.21.1",
-    "@holochain-syn/client": "^0.701.0",
-    "@holochain-syn/store": "^0.701.0",
+    "@holochain-syn/client": "^0.701.1",
+    "@holochain-syn/store": "^0.701.1",
     "@lit/context": "^1.0.0",
     "@lit/localize": "^0.12.0",
     "@scoped-elements/cytoscape": "^0.2.0",
