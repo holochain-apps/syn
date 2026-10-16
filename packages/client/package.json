@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/client",
-  "version": "0.700.1",
+  "version": "0.701.0",
   "description": "Zome client and wire types for syn, the real-time shared-state engine for Holochain",
   "license": "CAL-1.0",
   "repository": {
@@ -31,8 +31,8 @@
   },
   "dependencies": {
     "@automerge/automerge": "^3.4.0",
-    "@holochain-open-dev/utils": "^0.700.0",
-    "@holochain/client": "^0.21.0",
+    "@holochain-open-dev/utils": "^0.701.0",
+    "@holochain/client": "^0.21.1",
     "@msgpack/msgpack": "^2.7.0"
   },
   "devDependencies": {

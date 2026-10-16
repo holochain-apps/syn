@@ -17,7 +17,6 @@
     "launch:happ": "concurrently \"hc-spin -n $AGENTS workdir/syn-test.happ --ui-port $UI_PORT \"",
     "dev:libs": "concurrently \"npm run build:watch -w @holochain-syn/client\" \"npm run build:watch -w @holochain-syn/store\" \"npm run build:watch -w @holochain-syn/core\" \"npm run build:watch -w @holochain-syn/text-editor\"",
     "prepare": "npm run build:libs",
-    "publish": "scripts/publish.sh",
     "build:libs": "npm run build -w @holochain-syn/client -w @holochain-syn/store -w @holochain-syn/core -w @holochain-syn/text-editor",
     "build:ui": "npm run build -w demo",
     "test-quick": "npm test -w tests",
@@ -38,7 +37,7 @@
     "demo"
   ],
   "devDependencies": {
-    "@holochain/hc-spin": "^0.700.0",
+    "@holochain/hc-spin": "^0.700.1-rc.0",
     "concurrently": "^6.2.1",
     "eslint": "^7.32.0",
     "eslint-config-prettier": "^8.3.0",
@@ -58,5 +57,8 @@
   "prettier": {
     "singleQuote": true,
     "arrowParens": "avoid"
+  },
+  "overrides": {
+    "@holochain/client": "^0.21.1"
   }
 }

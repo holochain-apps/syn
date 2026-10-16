@@ -1,6 +1,6 @@
 {
   "name": "@holochain-syn/core",
-  "version": "0.700.1",
+  "version": "0.701.0",
   "description": "Contexts and Lit elements for building syn Holochain applications",
   "license": "CAL-1.0",
   "repository": {
@@ -28,13 +28,13 @@
     "build:watch": "tsc -w --preserveWatchOutput"
   },
   "dependencies": {
-    "@holochain-open-dev/elements": "^0.700.0",
-    "@holochain-open-dev/profiles": "^0.701.0",
-    "@holochain-open-dev/stores": "^0.700.0",
-    "@holochain-open-dev/utils": "^0.700.0",
-    "@holochain/client": "^0.21.0",
-    "@holochain-syn/client": "^0.700.1",
-    "@holochain-syn/store": "^0.700.1",
+    "@holochain-open-dev/elements": "^0.701.0",
+    "@holochain-open-dev/profiles": "^0.702.0",
+    "@holochain-open-dev/stores": "^0.701.0",
+    "@holochain-open-dev/utils": "^0.701.0",
+    "@holochain/client": "^0.21.1",
+    "@holochain-syn/client": "^0.701.0",
+    "@holochain-syn/store": "^0.701.0",
     "@lit/context": "^1.0.0",
     "@lit/localize": "^0.12.0",
     "@scoped-elements/cytoscape": "^0.2.0",
