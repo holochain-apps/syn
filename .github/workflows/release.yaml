@@ -1,0 +1,43 @@
+name: release
+
+# Publishes to npm with trusted publishing (OIDC): no npm token is stored in
+# this repository. Each package's trusted publisher on npmjs.com must name this
+# repository and this workflow file (release.yaml).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@^11.10.0
+
+      - run: npm ci
+
+      - run: node --test scripts/publish-npm.test.mjs
+
+      - name: Build
+        run: npm run build:libs
+
+      - name: Publish
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: node scripts/publish-npm.mjs packages/client packages/store packages/core packages/text-editor
